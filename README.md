@@ -280,13 +280,32 @@ agentcoord approve <id>    # Approve pending requests
 
 ## Running Redis
 
-```bash
-# Local development
-docker run -d -p 6379:6379 redis:7-alpine
+### Local Development (No Auth)
 
-# Production (Railway)
-railway add redis
+```bash
+# Dev only - NO PASSWORD
+docker run -d -p 6379:6379 redis:7-alpine
 ```
+
+### Production (Auth Required)
+
+```bash
+# With authentication (REQUIRED for production)
+docker run -d -p 6379:6379 redis:7-alpine redis-server --requirepass your-strong-password
+
+# Set Redis URL with auth
+export REDIS_URL="redis://:your-strong-password@localhost:6379"
+
+# Or use Railway/managed Redis (recommended)
+railway add redis
+export REDIS_URL=$(railway variables get REDIS_URL)
+```
+
+**⚠️ SECURITY WARNING:**
+- **NEVER** run Redis without auth in production
+- **NEVER** expose Redis port to internet without TLS
+- **ALWAYS** use `REDIS_URL` with password in prod
+- See `SECURITY.md` for full security guide
 
 ## Testing
 

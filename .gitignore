@@ -70,3 +70,9 @@ health_checks.py
 quality_review.py
 scripts/generate_integration_diagrams.py
 examples/nexus_style_demo.py
+
+# Generated documentation (workers produce these)
+*_SUMMARY.md
+*_GUIDE.md
+*_BUILD_*.md
+QUICK_START.md

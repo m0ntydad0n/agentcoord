@@ -66,7 +66,15 @@ class WorkerProcess:
 class WorkerSpawner:
     """Manages spawning and lifecycle of worker agents."""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(self, redis_url: str = None):
+        """Initialize worker spawner.
+
+        Args:
+            redis_url: Redis URL. If None, uses REDIS_URL env var.
+                      Format: redis://[:password@]host:port
+        """
+        # Use REDIS_URL from environment if not provided
+        redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379")
         self.redis_url = redis_url
         self.workers: Dict[str, WorkerProcess] = {}
 

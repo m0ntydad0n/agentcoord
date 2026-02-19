@@ -11,13 +11,19 @@ from typing import Optional, List
 from agentcoord import CoordinationClient
 from agentcoord.tasks import TaskQueue, TaskStatus
 
-# Check for Anthropic API key
+# Check for Anthropic API key (NEVER log the actual key value)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 if not ANTHROPIC_API_KEY:
     print("❌ Error: ANTHROPIC_API_KEY not set")
     print("   Set it with: export ANTHROPIC_API_KEY='your-key-here'")
+    print("   See SECURITY.md for best practices")
     sys.exit(1)
+
+# Validate key format but don't log it
+if not ANTHROPIC_API_KEY.startswith("sk-ant-"):
+    print("⚠️  Warning: API key doesn't match expected format (should start with 'sk-ant-')")
+    print("   Proceeding anyway, but verify your key is correct")
 
 
 class LLMWorkerAgent:
@@ -141,9 +147,10 @@ more code
                 }]
             )
 
-            # Extract response
+            # Extract response (NEVER log the full response - may contain sensitive data)
             code_response = response.content[0].text
 
+            # Only log token counts, not content
             print(f"   ✅ LLM Response received ({response.usage.input_tokens} in, {response.usage.output_tokens} out)")
 
             # Parse and write files

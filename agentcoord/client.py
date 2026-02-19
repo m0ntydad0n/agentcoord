@@ -17,20 +17,31 @@ from .audit import AuditLog
 class CoordinationClient:
     """Central coordination client for multi-agent systems."""
 
-    def __init__(self, redis_url: str, fallback_dir: str = "./workbench"):
+    def __init__(self, redis_url: str = None, fallback_dir: str = "./workbench"):
         """Initialize coordination client.
 
         Args:
-            redis_url: Redis connection URL (e.g., redis://localhost:6379)
+            redis_url: Redis connection URL. If None, uses REDIS_URL env var.
+                      Format: redis://[:password@]host:port
+                      For TLS: rediss://[:password@]host:port
+                      Examples:
+                        - redis://localhost:6379 (dev, no auth)
+                        - redis://:mypassword@localhost:6379 (with auth)
+                        - rediss://:prod-pass@redis.example.com:6380 (prod TLS)
             fallback_dir: Directory for file-based fallback (default: ./workbench)
         """
-        self.redis_url = redis_url
+        # Use REDIS_URL from environment if not provided
+        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379")
         self.fallback_dir = fallback_dir
         self.redis_client: Optional[redis.Redis] = None
 
         # Try to connect to Redis
         try:
-            self.redis_client = redis.from_url(redis_url, socket_connect_timeout=1, decode_responses=True)
+            self.redis_client = redis.from_url(
+                self.redis_url,
+                socket_connect_timeout=1,
+                decode_responses=True
+            )
             self.redis_client.ping()
             self.mode = "redis"
         except (redis.ConnectionError, redis.TimeoutError, Exception):
