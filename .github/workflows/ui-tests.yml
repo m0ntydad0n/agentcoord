@@ -1,0 +1,46 @@
+name: Cyberpunk UI Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ui-tests:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        pip install -r requirements-test.txt
+    
+    - name: Setup Chrome
+      uses: browser-actions/setup-chrome@latest
+    
+    - name: Run UI tests
+      run: |
+        export DISPLAY=:99
+        Xvfb :99 -screen 0 1920x1080x24 &
+        pytest tests/test_cyberpunk_ui.py -v --tb=short
+    
+    - name: Upload screenshots on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ui-test-screenshots
+        path: screenshots/

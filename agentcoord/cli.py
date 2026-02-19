@@ -2,6 +2,7 @@
 
 import click
 import os
+import sys
 from datetime import datetime
 from .llm import LLMBudget
 from .client import CoordinationClient
@@ -9,6 +10,21 @@ from .agent import AgentRegistry
 from .tasks import TaskQueue
 from .board import Board
 from .approvals import ApprovalWorkflow
+
+
+def launch_tui():
+    """Launch the TUI interface."""
+    try:
+        from .tui import TUIApp
+        app = TUIApp()
+        app.run()
+        return True
+    except ImportError as e:
+        click.echo(f"TUI not available: {e}", err=True)
+        return False
+    except Exception as e:
+        click.echo(f"TUI error: {e}", err=True)
+        return False
 
 
 @click.group()
@@ -291,6 +307,30 @@ def budget(ctx):
         console.print(table)
 
     console.print()
+
+
+@cli.command()
+@click.option('--refresh-rate', default=1.0, type=float,
+              help='Dashboard refresh rate in seconds')
+@click.pass_context
+def dashboard(ctx, refresh_rate):
+    """Launch live monitoring dashboard with cyberpunk UI."""
+    if ctx.obj['mode'] == 'file':
+        click.echo("Dashboard requires Redis connection")
+        return
+
+    try:
+        from .dashboard import AgentCoordDashboard
+    except ImportError:
+        click.echo("❌ Dashboard requires 'rich' package. Install with: pip install rich")
+        return
+
+    dash = AgentCoordDashboard(ctx.obj['redis'], refresh_rate=refresh_rate)
+
+    click.echo("\n🚀 Launching live dashboard...")
+    click.echo("   Press Ctrl+C to exit\n")
+
+    dash.run()
 
 
 if __name__ == '__main__':

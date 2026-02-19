@@ -1,266 +1,278 @@
-"""
-Interactive Planning CLI for AgentCoord.
+import json
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from .interactive_prompts import InteractivePrompts
+from .task_manager import TaskManager
 
-User-facing interface for planning and executing multi-agent workflows
-with cost/quality optimization preferences.
-"""
+@dataclass
+class TaskData:
+    title: str = ""
+    description: str = ""
+    priority: int = 1
+    tags: List[str] = None
+    dependencies: List[str] = None
+    
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
+        if self.dependencies is None:
+            self.dependencies = []
 
-import click
-import sys
-from typing import Optional, List, Dict
-from .client import CoordinationClient
-from .tasks import TaskQueue
-from .planner import TaskPlanner, OptimizationMode, format_plan_summary, ExecutionPlan
-from .spawner import WorkerSpawner, SpawnMode
-
-
-@click.group()
-def interactive():
-    """Interactive planning and execution for AgentCoord."""
-    pass
-
-
-@interactive.command()
-@click.option('--redis-url', envvar='REDIS_URL', default='redis://localhost:6379',
-              help='Redis connection URL')
-@click.option('--auto-execute', is_flag=True, help='Auto-execute plan without confirmation')
-def plan(redis_url: str, auto_execute: bool):
-    """
-    Interactive planning workflow.
-
-    Analyzes pending tasks, estimates costs, and generates execution plan
-    with user preferences.
-    """
-    click.echo("\n🤖 AgentCoord Interactive Planning\n")
-
-    # Connect to Redis
-    try:
-        import redis
-        redis_client = redis.from_url(redis_url, socket_connect_timeout=1, decode_responses=True)
-        redis_client.ping()
-    except Exception as e:
-        click.echo(f"❌ Cannot connect to Redis at {redis_url}", err=True)
-        click.echo(f"   Error: {e}", err=True)
-        click.echo(f"\n   Start Redis with: brew services start redis", err=True)
-        sys.exit(1)
-
-    # Get pending tasks
-    task_queue = TaskQueue(redis_client)
-    pending_tasks = task_queue.list_pending_tasks()
-
-    if not pending_tasks:
-        click.echo("📭 No pending tasks in queue")
-        click.echo("\n   Create tasks first using:")
-        click.echo("   python -m agentcoord.cli tasks")
-        sys.exit(0)
-
-    click.echo(f"📋 Found {len(pending_tasks)} pending tasks\n")
-
-    # Show task list
-    click.echo("Tasks:")
-    for i, task in enumerate(pending_tasks, 1):
-        click.echo(f"  {i}. {task.title} (priority: {task.priority})")
-
-    click.echo()
-
-    # Ask for optimization preference
-    if not auto_execute:
-        click.echo("How should I optimize this workflow?\n")
-        click.echo("  1. Cost - Minimize cost, use smaller/faster models")
-        click.echo("  2. Balanced - Balance cost and quality (recommended)")
-        click.echo("  3. Quality - Maximize quality, use best models\n")
-
-        mode_choice = click.prompt("Choose optimization mode", type=click.Choice(['1', '2', '3']), default='2')
-
-        mode_map = {
-            '1': OptimizationMode.COST,
-            '2': OptimizationMode.BALANCED,
-            '3': OptimizationMode.QUALITY
+class TaskCreationWizard:
+    def __init__(self, task_manager: TaskManager):
+        self.prompts = InteractivePrompts()
+        self.task_manager = task_manager
+        self.task_data = TaskData()
+        self.current_step = 1
+        self.total_steps = 6
+        
+    def show_progress(self):
+        """Display progress bar for current step"""
+        progress = "=" * self.current_step + "-" * (self.total_steps - self.current_step)
+        self.prompts.display_info(f"Step {self.current_step}/{self.total_steps} [{progress}]")
+        
+    def step_1_title(self) -> bool:
+        """Step 1: Task title with validation"""
+        self.show_progress()
+        self.prompts.display_header("Task Title")
+        
+        while True:
+            title = self.prompts.text_input(
+                "Enter task title",
+                default=self.task_data.title,
+                required=True
+            )
+            
+            if not title or len(title.strip()) == 0:
+                self.prompts.display_error("Title cannot be empty")
+                continue
+                
+            if len(title) > 100:
+                self.prompts.display_error("Title must be 100 characters or less")
+                continue
+                
+            # Check for duplicate titles
+            existing_tasks = self.task_manager.get_all_tasks()
+            if any(task.title.lower() == title.lower() for task in existing_tasks):
+                self.prompts.display_warning("A task with this title already exists")
+                if not self.prompts.confirm("Continue anyway?"):
+                    continue
+                    
+            self.task_data.title = title.strip()
+            return True
+    
+    def step_2_description(self) -> bool:
+        """Step 2: Multi-line description"""
+        self.show_progress()
+        self.prompts.display_header("Task Description")
+        
+        description = self.prompts.multiline_text_input(
+            "Enter task description (press Ctrl+D when finished)",
+            default=self.task_data.description,
+            placeholder="Detailed description of the task..."
+        )
+        
+        self.task_data.description = description.strip()
+        return True
+    
+    def step_3_priority(self) -> bool:
+        """Step 3: Priority slider (1-5)"""
+        self.show_progress()
+        self.prompts.display_header("Task Priority")
+        
+        priority_labels = {
+            1: "Very Low",
+            2: "Low", 
+            3: "Medium",
+            4: "High",
+            5: "Critical"
         }
-        optimization_mode = mode_map[mode_choice]
-    else:
-        optimization_mode = OptimizationMode.BALANCED
-
-    # Ask for budget limit
-    budget_limit = None
-    if not auto_execute:
-        has_budget = click.confirm("\nDo you want to set a budget limit?", default=False)
-        if has_budget:
-            budget_limit = click.prompt("Enter budget limit in dollars", type=float)
-
-    # Create plan
-    click.echo(f"\n🧠 Analyzing tasks and creating execution plan...\n")
-
-    planner = TaskPlanner()
-    tasks_dict = [
-        {
-            'id': task.id,
-            'title': task.title,
-            'description': task.description,
-            'depends_on': task.depends_on or [],
-            'tags': task.tags or []
+        
+        self.prompts.display_info("Priority levels:")
+        for level, label in priority_labels.items():
+            self.prompts.display_info(f"  {level} - {label}")
+        
+        priority = self.prompts.slider_input(
+            "Select priority level",
+            min_value=1,
+            max_value=5,
+            default=self.task_data.priority,
+            step=1,
+            show_value=lambda x: f"{x} ({priority_labels[x]})"
+        )
+        
+        self.task_data.priority = priority
+        return True
+    
+    def step_4_tags(self) -> bool:
+        """Step 4: Tags selection with checkboxes"""
+        self.show_progress()
+        self.prompts.display_header("Task Tags")
+        
+        # Get existing tags from other tasks
+        existing_tasks = self.task_manager.get_all_tasks()
+        all_tags = set()
+        for task in existing_tasks:
+            all_tags.update(task.tags if hasattr(task, 'tags') else [])
+        
+        # Common predefined tags
+        predefined_tags = ["urgent", "feature", "bug", "documentation", "testing", "research"]
+        available_tags = sorted(list(all_tags.union(predefined_tags)))
+        
+        if available_tags:
+            selected_tags = self.prompts.checkbox_input(
+                "Select tags for this task",
+                options=available_tags,
+                selected=self.task_data.tags
+            )
+        else:
+            selected_tags = []
+        
+        # Allow custom tags
+        custom_tags = self.prompts.text_input(
+            "Add custom tags (comma-separated)",
+            default=",".join([tag for tag in self.task_data.tags if tag not in selected_tags])
+        )
+        
+        if custom_tags:
+            custom_tag_list = [tag.strip() for tag in custom_tags.split(",") if tag.strip()]
+            selected_tags.extend(custom_tag_list)
+        
+        self.task_data.tags = list(set(selected_tags))  # Remove duplicates
+        return True
+    
+    def step_5_dependencies(self) -> bool:
+        """Step 5: Dependencies with autocomplete"""
+        self.show_progress()
+        self.prompts.display_header("Task Dependencies")
+        
+        existing_tasks = self.task_manager.get_all_tasks()
+        available_tasks = [task.title for task in existing_tasks]
+        
+        if not available_tasks:
+            self.prompts.display_info("No existing tasks found for dependencies")
+            self.task_data.dependencies = []
+            return True
+        
+        self.prompts.display_info("Select tasks that must be completed before this task:")
+        
+        selected_deps = self.prompts.checkbox_input(
+            "Select dependencies",
+            options=available_tasks,
+            selected=self.task_data.dependencies,
+            optional=True
+        )
+        
+        self.task_data.dependencies = selected_deps or []
+        return True
+    
+    def step_6_confirmation(self) -> bool:
+        """Step 6: Confirmation and preview"""
+        self.show_progress()
+        self.prompts.display_header("Task Preview")
+        
+        # Display task summary
+        self.prompts.display_info("Review your task:")
+        self.prompts.display_box([
+            f"Title: {self.task_data.title}",
+            f"Description: {self.task_data.description[:100]}{'...' if len(self.task_data.description) > 100 else ''}",
+            f"Priority: {self.task_data.priority}",
+            f"Tags: {', '.join(self.task_data.tags) if self.task_data.tags else 'None'}",
+            f"Dependencies: {', '.join(self.task_data.dependencies) if self.task_data.dependencies else 'None'}"
+        ])
+        
+        return self.prompts.confirm("Create this task?", default=True)
+    
+    def run_wizard(self) -> Optional[Dict[str, Any]]:
+        """Run the complete wizard"""
+        self.prompts.display_header("Task Creation Wizard")
+        self.prompts.display_info("Create a new task with guided steps")
+        
+        steps = [
+            self.step_1_title,
+            self.step_2_description, 
+            self.step_3_priority,
+            self.step_4_tags,
+            self.step_5_dependencies,
+            self.step_6_confirmation
+        ]
+        
+        while self.current_step <= len(steps):
+            try:
+                # Show navigation options (except on first step)
+                if self.current_step > 1:
+                    nav_choice = self.prompts.menu_select(
+                        "Navigation",
+                        options=["Continue", "Back", "Cancel"],
+                        default=0
+                    )
+                    
+                    if nav_choice == 1:  # Back
+                        if self.current_step > 1:
+                            self.current_step -= 1
+                        continue
+                    elif nav_choice == 2:  # Cancel
+                        if self.prompts.confirm("Are you sure you want to cancel?"):
+                            return None
+                        continue
+                
+                # Execute current step
+                if steps[self.current_step - 1]():
+                    self.current_step += 1
+                else:
+                    # Step failed, stay on current step
+                    continue
+                    
+            except KeyboardInterrupt:
+                if self.prompts.confirm("\nCancel task creation?"):
+                    return None
+                continue
+        
+        # Create the task
+        task_dict = {
+            "title": self.task_data.title,
+            "description": self.task_data.description,
+            "priority": self.task_data.priority,
+            "tags": self.task_data.tags,
+            "dependencies": self.task_data.dependencies,
+            "status": "pending"
         }
-        for task in pending_tasks
-    ]
+        
+        return task_dict
 
-    plan = planner.create_execution_plan(
-        tasks=tasks_dict,
-        optimization_mode=optimization_mode,
-        budget_limit=budget_limit,
-        max_agents=10
-    )
-
-    # Show plan
-    plan_summary = format_plan_summary(plan)
-    click.echo(plan_summary)
-
-    # Budget check
-    if not plan.within_budget:
-        click.echo("⚠️  WARNING: Plan exceeds budget limit!")
-        click.echo(f"   Estimated: ${plan.total_estimated_cost:.2f}")
-        click.echo(f"   Budget: ${plan.budget_limit:.2f}")
-        click.echo(f"   Overage: ${plan.total_estimated_cost - plan.budget_limit:.2f}\n")
-
-        if not auto_execute:
-            continue_anyway = click.confirm("Continue anyway?", default=False)
-            if not continue_anyway:
-                click.echo("\n❌ Aborted by user")
-                sys.exit(0)
-
-    # Confirm execution
-    if not auto_execute:
-        click.echo()
-        execute = click.confirm(
-            f"Execute this plan? (Will spawn {plan.recommended_agents} agents)",
-            default=True
-        )
-
-        if not execute:
-            click.echo("\n✅ Plan saved but not executed")
-            # TODO: Save plan to file
-            sys.exit(0)
-
-    # Execute plan
-    click.echo(f"\n🚀 Executing plan with {plan.recommended_agents} agents...\n")
-
-    spawner = WorkerSpawner(redis_url=redis_url)
-
-    # Spawn workers
-    for i in range(plan.recommended_agents):
-        worker = spawner.spawn_worker(
-            name=f"PlanWorker-{i+1}",
-            tags=None,  # Claim any task
-            mode=SpawnMode.SUBPROCESS,
-            max_tasks=None,  # Work until queue empty
-            poll_interval=3
-        )
-        click.echo(f"  ✅ Spawned {worker.name}")
-
-    click.echo(f"\n✅ Spawned {plan.recommended_agents} workers")
-    click.echo(f"\n📊 Monitor progress:")
-    click.echo(f"   python -m agentcoord.cli status   # View agent status")
-    click.echo(f"   python -m agentcoord.cli tasks    # View task queue")
-    click.echo(f"   python -m agentcoord.cli budget   # View cost tracking\n")
-
-    click.echo("Workers will run in background until queue is empty.")
-    click.echo("Use Ctrl+C to stop this session (workers continue running).\n")
-
-
-@interactive.command()
-@click.option('--redis-url', envvar='REDIS_URL', default='redis://localhost:6379',
-              help='Redis connection URL')
-@click.option('--title', prompt='Task title', help='Short task title')
-@click.option('--description', prompt='Task description', help='Detailed task description')
-@click.option('--priority', type=int, default=3, help='Priority 1-5 (5 highest)')
-@click.option('--tags', help='Comma-separated tags')
-def create_task(redis_url: str, title: str, description: str, priority: int, tags: Optional[str]):
-    """Create a new task interactively."""
+def create_task(task_manager: TaskManager = None) -> bool:
+    """Interactive task creation function"""
+    if task_manager is None:
+        task_manager = TaskManager()
+    
+    wizard = TaskCreationWizard(task_manager)
+    
     try:
-        import redis
-        redis_client = redis.from_url(redis_url, socket_connect_timeout=1, decode_responses=True)
-        redis_client.ping()
-    except Exception as e:
-        click.echo(f"❌ Cannot connect to Redis at {redis_url}", err=True)
-        sys.exit(1)
-
-    tag_list = [t.strip() for t in tags.split(',')] if tags else []
-
-    task_queue = TaskQueue(redis_client)
-    task = task_queue.create_task(
-        title=title,
-        description=description,
-        priority=priority,
-        tags=tag_list
-    )
-
-    click.echo(f"\n✅ Created task: {task.id}")
-    click.echo(f"   Title: {task.title}")
-    click.echo(f"   Priority: {task.priority}")
-    if tag_list:
-        click.echo(f"   Tags: {', '.join(tag_list)}")
-
-
-@interactive.command()
-@click.option('--redis-url', envvar='REDIS_URL', default='redis://localhost:6379',
-              help='Redis connection URL')
-def estimate(redis_url: str):
-    """Estimate costs for pending tasks without executing."""
-    click.echo("\n💰 Cost Estimation for Pending Tasks\n")
-
-    # Connect to Redis
-    try:
-        import redis
-        redis_client = redis.from_url(redis_url, socket_connect_timeout=1, decode_responses=True)
-        redis_client.ping()
-    except Exception as e:
-        click.echo(f"❌ Cannot connect to Redis at {redis_url}", err=True)
-        sys.exit(1)
-
-    # Get pending tasks
-    task_queue = TaskQueue(redis_client)
-    pending_tasks = task_queue.list_pending_tasks()
-
-    if not pending_tasks:
-        click.echo("📭 No pending tasks in queue")
-        sys.exit(0)
-
-    click.echo(f"📋 Analyzing {len(pending_tasks)} tasks...\n")
-
-    planner = TaskPlanner()
-    tasks_dict = [
-        {
-            'id': task.id,
-            'title': task.title,
-            'description': task.description,
-            'depends_on': task.depends_on or [],
-            'tags': task.tags or []
-        }
-        for task in pending_tasks
-    ]
-
-    # Generate estimates for all modes
-    modes = [OptimizationMode.COST, OptimizationMode.BALANCED, OptimizationMode.QUALITY]
-
-    click.echo(f"{'Mode':<12} {'Cost':<12} {'Time':<12} {'Agents':<8}")
-    click.echo("=" * 50)
-
-    for mode in modes:
-        plan = planner.create_execution_plan(
-            tasks=tasks_dict,
-            optimization_mode=mode,
-            max_agents=10
+        task_data = wizard.run_wizard()
+        
+        if task_data is None:
+            wizard.prompts.display_warning("Task creation cancelled")
+            return False
+        
+        # Create the task
+        task = task_manager.create_task(
+            title=task_data["title"],
+            description=task_data["description"],
+            priority=task_data["priority"],
+            tags=task_data["tags"],
+            dependencies=task_data["dependencies"]
         )
+        
+        wizard.prompts.display_success(f"Task '{task.title}' created successfully!")
+        wizard.prompts.display_info(f"Task ID: {task.id}")
+        
+        return True
+        
+    except Exception as e:
+        wizard.prompts.display_error(f"Failed to create task: {str(e)}")
+        return False
 
-        click.echo(
-            f"{mode.value:<12} "
-            f"${plan.total_estimated_cost:<11.2f} "
-            f"~{plan.total_estimated_duration_minutes} min{'':<6} "
-            f"{plan.recommended_agents}"
-        )
-
-    click.echo()
-    click.echo("💡 Run 'agentcoord-plan plan' to execute with your preferred mode")
-
-
-if __name__ == '__main__':
-    interactive()
+# Integration function for command line
+def create_task_command():
+    """Command line entry point for task creation"""
+    return create_task()
