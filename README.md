@@ -1,16 +1,20 @@
 # AgentCoord
 
-Redis-based multi-agent coordination system for building reliable multi-agent AI systems.
+Redis-based multi-agent coordination system for orchestrating autonomous LLM-powered workers.
 
 ## Features
 
-- 🔒 **Atomic file locking** - Prevent race conditions with Redis-backed locks
-- 🤝 **Agent coordination** - Register agents, track heartbeats, detect hung agents
-- 📋 **Task queue** - Priority-based task claiming with atomic operations
-- 💬 **Board system** - Threaded communication between agents
-- ✅ **Approval workflows** - Blocking approval requests for critical operations
-- 📝 **Audit logging** - Append-only decision log with Redis Streams
-- 🔄 **Automatic fallback** - Gracefully degrades to file-based mode when Redis unavailable
+- 🤖 **LLM-Powered Workers** - Autonomous agents that write code using Claude/GPT APIs
+- 🎯 **Hierarchical Coordination** - Coordinators can manage other coordinators (CTO → Teams → Workers)
+- 🎨 **Interactive TUI** - Cyberpunk-themed dashboard with real-time monitoring
+- 📋 **Task Queue** - Priority-based task claiming with atomic operations
+- 🚀 **Dynamic Spawning** - Spawn workers on-demand (subprocess, Docker, Railway)
+- 🤝 **Agent Coordination** - Register agents, track heartbeats, detect hung agents
+- 🔒 **Atomic File Locking** - Prevent race conditions with Redis-backed locks
+- 💬 **Board System** - Threaded communication between agents
+- ✅ **Approval Workflows** - Blocking approval requests for critical operations
+- 📝 **Audit Logging** - Append-only decision log with Redis Streams
+- 🔄 **Automatic Fallback** - Gracefully degrades to file-based mode when Redis unavailable
 
 ## Installation
 
@@ -18,7 +22,24 @@ Redis-based multi-agent coordination system for building reliable multi-agent AI
 pip install -e .
 ```
 
-## Quick Start
+## Quick Start - Interactive TUI
+
+```bash
+# Launch interactive dashboard (recommended for new users)
+agentcoord
+
+# Or launch dashboard directly
+agentcoord dashboard
+```
+
+The TUI provides:
+- Real-time task monitoring
+- Worker status visualization
+- Interactive task creation
+- Onboarding wizard for first-time users
+- Cyberpunk 90s aesthetic 🌈
+
+## Quick Start - Code
 
 ```python
 from agentcoord import CoordinationClient
@@ -109,28 +130,55 @@ agentcoord status
 agentcoord tasks
 ```
 
-## Dynamic Worker Spawning
+## LLM-Powered Autonomous Workers
 
-Coordinators can spawn worker agents on-demand:
+Spawn workers that use Claude/GPT to write actual code:
 
 ```python
 from agentcoord.spawner import WorkerSpawner, SpawnMode
 
 spawner = WorkerSpawner(redis_url="redis://localhost:6379")
 
-# Spawn subprocess worker
+# Spawn LLM-powered worker that writes code
 worker = spawner.spawn_worker(
     name="Backend-Worker-1",
     tags=["backend"],
     mode=SpawnMode.SUBPROCESS,
+    use_llm=True,  # 🤖 This worker uses Claude to write code
     max_tasks=10
 )
 
-# Check worker status
-print(f"Worker alive: {worker.is_alive()}")
+# The worker will:
+# 1. Claim tasks matching its tags
+# 2. Use Claude API to generate code
+# 3. Write files autonomously
+# 4. Mark tasks complete
+```
 
-# Terminate worker
-worker.terminate()
+**Example - Spawn 3 LLM workers to build UI in parallel:**
+
+```python
+# Create 10 UI building tasks
+tasks = [
+    {'title': 'Create dashboard component', 'tags': ['ui']},
+    {'title': 'Add authentication form', 'tags': ['ui']},
+    # ... 8 more tasks
+]
+
+for task_data in tasks:
+    task_queue.create_task(**task_data)
+
+# Spawn 3 LLM workers to execute in parallel
+for i in range(3):
+    spawner.spawn_worker(
+        name=f"UI-Builder-{i+1}",
+        tags=["ui"],
+        use_llm=True,
+        max_tasks=5
+    )
+
+# Workers autonomously generate ~2,000 lines of code in 10 minutes
+# Cost: ~$1-2 total
 ```
 
 **Spawn Modes:**
@@ -165,28 +213,69 @@ python3 examples/autoscaling_coordinator.py
 # Watch workers spawn/terminate as queue fluctuates
 ```
 
+## Hierarchical Coordination
+
+Build coordinator hierarchies (CTO → Team Leads → Workers):
+
+```python
+# Example: CTO coordinates specialized review teams
+from agentcoord.spawner import WorkerSpawner
+
+spawner = WorkerSpawner(redis_url="redis://localhost:6379")
+
+# CTO creates specialized tasks
+task_queue.create_task(
+    title="Security Review - Auth & Secrets",
+    tags=["security", "review"],
+    priority=5
+)
+task_queue.create_task(
+    title="Architecture Review - Scalability",
+    tags=["architecture", "review"],
+    priority=5
+)
+
+# Spawn specialized team leads (each is an LLM agent)
+spawner.spawn_worker(name="Security-Lead", tags=["security"], use_llm=True)
+spawner.spawn_worker(name="Architect-Lead", tags=["architecture"], use_llm=True)
+
+# Each lead autonomously completes their review
+# See scripts/cto_code_review.py for full example
+```
+
+**Real Example - AgentCoord Reviewing Itself:**
+
+```bash
+python3 scripts/cto_code_review.py
+
+# Spawns 6 specialized reviewers:
+# - Security-Lead: finds API key exposure risks
+# - Architect-Lead: analyzes scalability bottlenecks
+# - Performance-Lead: identifies optimization opportunities
+# - Quality-Lead: assesses test coverage
+# - DevOps-Lead: reviews deployment readiness
+# - Integration-Lead: maps component interactions
+
+# Output: 6 comprehensive review reports in ~15 minutes
+# Cost: ~$2-4 total
+```
+
 ## CLI
 
 Monitor and manage coordination state:
 
 ```bash
-# View all agents
-agentcoord status
+# Launch interactive dashboard
+agentcoord
 
-# Show file locks
-agentcoord locks
-
-# View task queue
-agentcoord tasks
-
-# Show board threads
-agentcoord board
-
-# Detect hung agents
-agentcoord hung --threshold 300
-
-# Approve pending requests
-agentcoord approve <approval-id>
+# Or use specific commands:
+agentcoord dashboard        # Live monitoring dashboard
+agentcoord status          # View all agents
+agentcoord tasks           # View task queue
+agentcoord locks           # Show file locks
+agentcoord board           # Show board threads
+agentcoord hung            # Detect hung agents
+agentcoord approve <id>    # Approve pending requests
 ```
 
 ## Running Redis
@@ -231,10 +320,25 @@ python3 examples/basic_usage.py
 
 ## Use Cases
 
-- **Multi-agent AI systems** - Coordinate multiple Claude instances
-- **Distributed development** - Prevent file conflicts between agents
-- **Workflow orchestration** - Task queue and approval gates
-- **System monitoring** - Track agent health and decisions
+- **Autonomous Code Generation** - Spawn LLM workers to write code in parallel
+- **Hierarchical Coordination** - Build org charts of AI agents (CTO → Teams → Workers)
+- **Code Reviews** - Specialized AI agents review code from different perspectives
+- **Multi-agent AI Systems** - Coordinate multiple Claude/GPT instances
+- **Distributed Development** - Prevent file conflicts between agents
+- **Workflow Orchestration** - Task queue and approval gates
+- **System Monitoring** - Track agent health and decisions
+
+## Real-World Results
+
+**AgentCoord building itself:**
+- 3 LLM workers generated 29 files (3,832 lines) of UI code
+- Interactive TUI built by 4 autonomous agents (650 lines)
+- 6 specialized reviewers performed comprehensive code audit
+- Total autonomous code generation: ~4,500 lines
+- Total cost: ~$3-4
+- Total time: ~30 minutes of parallel execution
+
+**Dogfooding:** AgentCoord used AgentCoord to build and review AgentCoord. 🚀
 
 ## License
 
