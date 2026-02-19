@@ -30,7 +30,7 @@ class CoordinationClient:
 
         # Try to connect to Redis
         try:
-            self.redis_client = redis.from_url(redis_url, socket_connect_timeout=1)
+            self.redis_client = redis.from_url(redis_url, socket_connect_timeout=1, decode_responses=True)
             self.redis_client.ping()
             self.mode = "redis"
         except (redis.ConnectionError, redis.TimeoutError, Exception):

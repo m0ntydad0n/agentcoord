@@ -3,6 +3,7 @@
 import click
 import os
 from datetime import datetime
+from .llm import LLMBudget
 from .client import CoordinationClient
 from .agent import AgentRegistry
 from .tasks import TaskQueue
@@ -22,7 +23,7 @@ def cli(ctx, redis_url):
     # Try to connect to Redis
     try:
         import redis
-        client = redis.from_url(redis_url, socket_connect_timeout=1)
+        client = redis.from_url(redis_url, socket_connect_timeout=1, decode_responses=True)
         client.ping()
         ctx.obj['redis'] = client
         ctx.obj['mode'] = 'redis'
@@ -102,7 +103,7 @@ def tasks(ctx):
         return
 
     task_queue = TaskQueue(ctx.obj['redis'])
-    all_tasks = task_queue.list_tasks()
+    all_tasks = task_queue.list_pending_tasks()
 
     if not all_tasks:
         click.echo("No tasks in queue")
@@ -217,6 +218,79 @@ def hung(ctx, threshold):
         )
 
     click.echo()
+
+
+@cli.command()
+@click.pass_context
+def budget(ctx):
+    """Show LLM budget usage and statistics."""
+    if ctx.obj['mode'] == 'file':
+        click.echo("Budget command requires Redis connection")
+        return
+
+    try:
+        from rich.console import Console
+        from rich.table import Table
+    except ImportError:
+        click.echo("This command requires the 'rich' package. Install with: pip install rich")
+        return
+
+    console = Console()
+
+    budget_tracker = LLMBudget(ctx.obj['redis'])
+    stats = budget_tracker.get_usage_stats()
+
+    # Header
+    console.print("\n[bold cyan]LLM Budget Status[/bold cyan]")
+    console.print("=" * 60)
+
+    # Summary
+    console.print(f"Daily Budget: ${stats['total_cost']:.2f}")
+    console.print(f"In-Flight: {stats['in_flight']} / {stats['max_concurrent']} slots\n")
+
+    # By Model table
+    if stats['by_model']:
+        table = Table(title="Usage by Model")
+        table.add_column("Model", style="cyan")
+        table.add_column("Tokens", justify="right", style="green")
+        table.add_column("Cost", justify="right", style="yellow")
+
+        for model, data in sorted(stats['by_model'].items()):
+            table.add_row(
+                model,
+                f"{data['tokens']:,}",
+                f"${data['cost']:.2f}"
+            )
+
+        console.print(table)
+        console.print()
+
+    # By Agent table
+    if stats['by_agent']:
+        table = Table(title="Usage by Agent")
+        table.add_column("Agent ID", style="cyan")
+        table.add_column("Calls", justify="right", style="magenta")
+        table.add_column("Tokens", justify="right", style="green")
+        table.add_column("Cost", justify="right", style="yellow")
+
+        # Sort by cost descending
+        sorted_agents = sorted(
+            stats['by_agent'].items(),
+            key=lambda x: x[1]['total_cost'],
+            reverse=True
+        )
+
+        for agent_id, data in sorted_agents[:10]:  # Top 10
+            table.add_row(
+                agent_id[:20] + "..." if len(agent_id) > 20 else agent_id,
+                str(data['calls']),
+                f"{data['total_tokens']:,}",
+                f"${data['total_cost']:.2f}"
+            )
+
+        console.print(table)
+
+    console.print()
 
 
 if __name__ == '__main__':

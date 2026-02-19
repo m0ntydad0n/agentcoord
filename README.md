@@ -55,6 +55,116 @@ with CoordinationClient.session(
     )
 ```
 
+## Orchestrator Pattern
+
+**Coordinator Agent** - One agent manages a team of workers:
+
+```python
+from examples.coordinator_agent import CoordinatorAgent
+
+# Create coordinator
+coordinator = CoordinatorAgent(name="MainCoordinator")
+coordinator.start()
+
+# Create tasks
+coordinator.create_tasks([
+    {'title': 'Implement auth', 'priority': 5, 'tags': ['backend']},
+    {'title': 'Design UI', 'priority': 4, 'tags': ['frontend']},
+])
+
+# Broadcast to workers
+coordinator.broadcast_message(
+    title="Project Kickoff",
+    message="Tasks ready - check queue",
+    priority="high"
+)
+
+# Run orchestration loop
+coordinator.run_orchestration_loop(interval=30, auto_approve=True)
+```
+
+**Worker Agents** - Autonomous agents that execute tasks:
+
+```python
+from examples.worker_agent import WorkerAgent
+
+# Create specialized worker
+worker = WorkerAgent(name="Backend-Worker", tags=["backend"])
+worker.start()
+
+# Run worker loop (claims and executes tasks)
+worker.run_worker_loop(poll_interval=5)
+```
+
+**Full Demo:**
+```bash
+# Terminal 1: Start coordinator
+python3 examples/coordinator_agent.py
+
+# Terminal 2: Start workers
+python3 examples/worker_agent.py multi
+
+# Terminal 3: Monitor
+agentcoord status
+agentcoord tasks
+```
+
+## Dynamic Worker Spawning
+
+Coordinators can spawn worker agents on-demand:
+
+```python
+from agentcoord.spawner import WorkerSpawner, SpawnMode
+
+spawner = WorkerSpawner(redis_url="redis://localhost:6379")
+
+# Spawn subprocess worker
+worker = spawner.spawn_worker(
+    name="Backend-Worker-1",
+    tags=["backend"],
+    mode=SpawnMode.SUBPROCESS,
+    max_tasks=10
+)
+
+# Check worker status
+print(f"Worker alive: {worker.is_alive()}")
+
+# Terminate worker
+worker.terminate()
+```
+
+**Spawn Modes:**
+- `SUBPROCESS` - Local Python processes (default)
+- `DOCKER` - Docker containers
+- `RAILWAY` - Railway cloud deployment
+
+## Auto-Scaling
+
+Auto-scale workers based on queue depth:
+
+```python
+from examples.autoscaling_coordinator import AutoScalingCoordinator
+from agentcoord.spawner import SpawnMode
+
+coordinator = AutoScalingCoordinator(
+    min_workers=2,      # Always keep 2 workers
+    max_workers=10,     # Scale up to 10 workers
+    tasks_per_worker=5, # Spawn 1 worker per 5 pending tasks
+    spawn_mode=SpawnMode.SUBPROCESS
+)
+
+coordinator.start()
+
+# Auto-scaling runs automatically
+coordinator.run_autoscaling_loop(interval=30)
+```
+
+**Demo:**
+```bash
+python3 examples/autoscaling_coordinator.py
+# Watch workers spawn/terminate as queue fluctuates
+```
+
 ## CLI
 
 Monitor and manage coordination state:

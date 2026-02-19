@@ -25,9 +25,12 @@ Usage:
 
 from .client import CoordinationClient
 from .locks import LockAcquireTimeout, FileLock
-from .tasks import Task, TaskStatus
+from .tasks import Task, TaskStatus, TaskQueue
 from .board import BoardThread, ThreadStatus
 from .approvals import Approval, ApprovalStatus
+from .escalation import EscalationCoordinator
+from .llm import LLMBudget, BudgetExceededError, SlotTimeoutError
+from .llm_fallback import LLMFallbackHandler, FallbackStrategy
 
 __version__ = "0.1.0"
 __all__ = [
@@ -36,8 +39,15 @@ __all__ = [
     "FileLock",
     "Task",
     "TaskStatus",
+    "TaskQueue",
     "BoardThread",
     "ThreadStatus",
     "Approval",
     "ApprovalStatus",
+    "EscalationCoordinator",
+    "LLMBudget",
+    "BudgetExceededError",
+    "SlotTimeoutError",
+    "LLMFallbackHandler",
+    "FallbackStrategy",
 ]

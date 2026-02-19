@@ -15,6 +15,7 @@ setup(
     entry_points={
         "console_scripts": [
             "agentcoord=agentcoord.cli:cli",
+            "agentcoord-plan=agentcoord.interactive_cli:interactive",
         ],
     },
     python_requires=">=3.8",

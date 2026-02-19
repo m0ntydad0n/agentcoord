@@ -22,6 +22,7 @@ class TaskStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    ESCALATED = "escalated"
 
 
 @dataclass
@@ -39,6 +40,15 @@ class Task:
     tags: List[str] = None
     depends_on: List[str] = None
     blocking: List[str] = None
+    # Escalation fields
+    retry_count: int = 0
+    max_retries: int = 3
+    retry_policy: str = "exponential"  # "linear", "exponential", "none"
+    retry_delay_base: int = 60  # seconds
+    escalated_at: Optional[str] = None
+    escalation_reason: Optional[str] = None
+    escalation_history: List[Dict[str, Any]] = None
+    parent_task_id: Optional[str] = None
 
     def __post_init__(self):
         if self.tags is None:
@@ -47,6 +57,8 @@ class Task:
             self.depends_on = []
         if self.blocking is None:
             self.blocking = []
+        if self.escalation_history is None:
+            self.escalation_history = []
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for Redis storage."""
@@ -62,12 +74,20 @@ class Task:
             status=TaskStatus(data["status"]),
             priority=int(data["priority"]),
             created_at=data["created_at"],
-            claimed_by=data.get("claimed_by"),
-            claimed_at=data.get("claimed_at"),
-            completed_at=data.get("completed_at"),
-            tags=json.loads(data.get("tags", "[]")),
-            depends_on=json.loads(data.get("depends_on", "[]")),
-            blocking=json.loads(data.get("blocking", "[]"))
+            claimed_by=data.get("claimed_by") or None,
+            claimed_at=data.get("claimed_at") or None,
+            completed_at=data.get("completed_at") or None,
+            tags=json.loads(data.get("tags") or "[]"),
+            depends_on=json.loads(data.get("depends_on") or "[]"),
+            blocking=json.loads(data.get("blocking") or "[]"),
+            retry_count=int(data.get("retry_count") or 0),
+            max_retries=int(data.get("max_retries") or 3),
+            retry_policy=data.get("retry_policy") or "exponential",
+            retry_delay_base=int(data.get("retry_delay_base") or 60),
+            escalated_at=data.get("escalated_at") or None,
+            escalation_reason=data.get("escalation_reason") or None,
+            escalation_history=json.loads(data.get("escalation_history") or "[]"),
+            parent_task_id=data.get("parent_task_id") or None
         )
 
 
@@ -89,7 +109,10 @@ class TaskQueue:
         description: str,
         priority: int = 3,
         tags: Optional[List[str]] = None,
-        depends_on: Optional[List[str]] = None
+        depends_on: Optional[List[str]] = None,
+        retry_policy: str = "exponential",
+        max_retries: int = 3,
+        retry_delay_base: int = 60
     ) -> Task:
         """Create a new task and add to queue."""
         task = Task(
@@ -100,7 +123,10 @@ class TaskQueue:
             priority=priority,
             created_at=datetime.now(timezone.utc).isoformat(),
             tags=tags or [],
-            depends_on=depends_on or []
+            depends_on=depends_on or [],
+            retry_policy=retry_policy,
+            max_retries=max_retries,
+            retry_delay_base=retry_delay_base
         )
 
         # Store task details in hash
@@ -110,7 +136,13 @@ class TaskQueue:
         task_dict["tags"] = json.dumps(task_dict["tags"])
         task_dict["depends_on"] = json.dumps(task_dict["depends_on"])
         task_dict["blocking"] = json.dumps(task_dict["blocking"])
+        task_dict["escalation_history"] = json.dumps(task_dict["escalation_history"])
         task_dict["status"] = task_dict["status"].value
+
+        # Redis doesn't accept None values, convert to empty strings
+        for key, value in list(task_dict.items()):
+            if value is None:
+                task_dict[key] = ""
 
         self.redis.hset(task_key, mapping=task_dict)
 
@@ -171,7 +203,13 @@ class TaskQueue:
         task_dict["tags"] = json.dumps(task_dict["tags"])
         task_dict["depends_on"] = json.dumps(task_dict["depends_on"])
         task_dict["blocking"] = json.dumps(task_dict["blocking"])
+        task_dict["escalation_history"] = json.dumps(task_dict["escalation_history"])
         task_dict["status"] = task_dict["status"].value
+
+        # Redis doesn't accept None values, convert to empty strings
+        for key, value in list(task_dict.items()):
+            if value is None:
+                task_dict[key] = ""
 
         self.redis.hset(task_key, mapping=task_dict)
 
@@ -200,3 +238,189 @@ class TaskQueue:
             if not dep_task or dep_task.status != TaskStatus.COMPLETED:
                 return False
         return True
+
+    def fail_task(self, task_id: str, error: str):
+        """
+        Mark task as FAILED and publish escalation event.
+
+        Args:
+            task_id: The task that failed
+            error: Error message/reason for failure
+        """
+        task = self.get_task(task_id)
+        if not task:
+            logger.error(f"Cannot fail task {task_id}: task not found")
+            return
+
+        # Update task status
+        task.status = TaskStatus.FAILED
+
+        # Add to escalation history
+        task.escalation_history.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "retry_count": task.retry_count,
+            "reason": error,
+            "action": "failed"
+        })
+
+        self.update_task(task)
+
+        # Publish escalation event
+        event = {
+            "event_type": "task_failed",
+            "task_id": task.id,
+            "task_title": task.title,
+            "reason": error,
+            "retry_count": task.retry_count,
+            "max_retries": task.max_retries,
+            "retry_policy": task.retry_policy,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "claimed_by": task.claimed_by
+        }
+        self.redis.publish("channel:escalations", json.dumps(event))
+        logger.info(f"Task {task_id} failed: {error}")
+
+    def schedule_retry(self, task: Task, delay: int) -> Task:
+        """
+        Schedule a task for retry after delay seconds.
+
+        Args:
+            task: The task to retry
+            delay: Delay in seconds before retry
+
+        Returns:
+            New task created for retry
+        """
+        # Create a new task for the retry
+        retry_task = Task(
+            id=str(uuid.uuid4()),
+            title=task.title,
+            description=task.description,
+            status=TaskStatus.PENDING,
+            priority=task.priority,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            tags=task.tags,
+            depends_on=task.depends_on,
+            retry_count=task.retry_count + 1,
+            max_retries=task.max_retries,
+            retry_policy=task.retry_policy,
+            retry_delay_base=task.retry_delay_base,
+            escalation_history=task.escalation_history.copy(),
+            parent_task_id=task.parent_task_id or task.id
+        )
+
+        # Add history entry
+        retry_task.escalation_history.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "retry_count": retry_task.retry_count,
+            "reason": f"Scheduled retry {retry_task.retry_count}/{retry_task.max_retries}",
+            "action": "retried"
+        })
+
+        # Store task
+        task_key = f"task:{retry_task.id}"
+        task_dict = retry_task.to_dict()
+        task_dict["tags"] = json.dumps(task_dict["tags"])
+        task_dict["depends_on"] = json.dumps(task_dict["depends_on"])
+        task_dict["blocking"] = json.dumps(task_dict["blocking"])
+        task_dict["escalation_history"] = json.dumps(task_dict["escalation_history"])
+        task_dict["status"] = task_dict["status"].value
+
+        for key, value in list(task_dict.items()):
+            if value is None:
+                task_dict[key] = ""
+
+        self.redis.hset(task_key, mapping=task_dict)
+
+        # Add to retry queue with scheduled time
+        retry_timestamp = int(time.time()) + delay
+        self.redis.zadd("tasks:retry", {retry_task.id: retry_timestamp})
+
+        logger.info(f"Scheduled retry for task {task.id} -> {retry_task.id} in {delay}s")
+        return retry_task
+
+    def escalate_task(self, task_id: str, reason: str):
+        """
+        Mark task as ESCALATED and add to escalated set.
+
+        Args:
+            task_id: Task to escalate
+            reason: Reason for escalation
+        """
+        task = self.get_task(task_id)
+        if not task:
+            logger.error(f"Cannot escalate task {task_id}: task not found")
+            return
+
+        # Update task status
+        task.status = TaskStatus.ESCALATED
+        task.escalated_at = datetime.now(timezone.utc).isoformat()
+        task.escalation_reason = reason
+
+        # Add to escalation history
+        task.escalation_history.append({
+            "timestamp": task.escalated_at,
+            "retry_count": task.retry_count,
+            "reason": reason,
+            "action": "escalated"
+        })
+
+        self.update_task(task)
+
+        # Add to escalated set
+        escalation_timestamp = int(time.time())
+        self.redis.zadd("tasks:escalated", {task.id: escalation_timestamp})
+
+        # Publish escalation event
+        event = {
+            "event_type": "task_escalated",
+            "task_id": task.id,
+            "task_title": task.title,
+            "reason": reason,
+            "retry_count": task.retry_count,
+            "timestamp": task.escalated_at,
+            "claimed_by": task.claimed_by
+        }
+        self.redis.publish("channel:escalations", json.dumps(event))
+        logger.info(f"Task {task_id} escalated: {reason}")
+
+    def get_retry_queue(self) -> List[Task]:
+        """Get tasks scheduled for retry."""
+        task_ids = self.redis.zrange("tasks:retry", 0, -1)
+        tasks = []
+        for task_id in task_ids:
+            task = self.get_task(task_id)
+            if task:
+                tasks.append(task)
+        return tasks
+
+    def get_escalated_tasks(self) -> List[Task]:
+        """Get all escalated tasks."""
+        task_ids = self.redis.zrevrange("tasks:escalated", 0, -1)
+        tasks = []
+        for task_id in task_ids:
+            task = self.get_task(task_id)
+            if task:
+                tasks.append(task)
+        return tasks
+
+    def process_retry_queue(self):
+        """
+        Process retry queue - move ready tasks back to pending.
+        Called by EscalationCoordinator.
+        """
+        current_time = int(time.time())
+        # Get all tasks ready for retry (score <= current_time)
+        ready_tasks = self.redis.zrangebyscore("tasks:retry", 0, current_time)
+
+        for task_id in ready_tasks:
+            task = self.get_task(task_id)
+            if task:
+                # Remove from retry queue
+                self.redis.zrem("tasks:retry", task_id)
+
+                # Add to pending queue
+                score = task.priority * 1000000 + int(time.time())
+                self.redis.zadd(self.queue_key, {task.id: score})
+
+                logger.info(f"Moved task {task_id} from retry to pending queue")

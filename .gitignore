@@ -48,3 +48,8 @@ Thumbs.db
 
 # Workbench (file-based fallback)
 workbench/
+
+# Audit reports (PRIVATE - never commit)
+*AUDIT*.md
+*audit*.md
+MULTI_AGENT*.md
