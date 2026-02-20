@@ -1,18 +1,32 @@
 # AgentCoord
 
-Redis-based multi-agent coordination system for orchestrating autonomous LLM-powered workers.
+Multi-agent coordination system that models real company structures with cross-functional workflows.
+
+## Overview
+
+AgentCoord orchestrates autonomous AI agents across Product, Engineering, QA, Marketing, and Support departments—mirroring how real companies coordinate work. Built for complexity: multi-role task routing, approval gates, and platform-agnostic communication.
 
 ## Features
 
+### Company Model
+- 🏢 **Real Org Structure** - 17 roles across 5 departments (Product, Engineering, QA, Marketing, Support)
+- 🎯 **Role-Based Permissions** - 50+ capabilities with inheritance (VPs inherit department capabilities)
+- 👥 **Hierarchical Teams** - Company → Department → Team → Agent with availability tracking
+- 📋 **Workflow Routing** - Automated task generation from Epic workflows (feature, bug, launch, trading_strategy)
+- ✅ **Approval Gates** - Multi-role sign-off for critical operations (production deploy requires EM + QA Lead + PM)
+- 🏗️ **Company Templates** - Load org structures from YAML (startup, scaleup, custom)
+
+### Communication
+- 💬 **Platform-Agnostic Channels** - Works out-of-box (Terminal, File, Dashboard) with optional Slack/Discord
+- 🔔 **Priority Messaging** - LOW, NORMAL, HIGH, URGENT with type tagging (STATUS, ERROR, SUCCESS)
+- 🧵 **Threaded Conversations** - Multi-channel thread support with UUID tracking
+- 📡 **Multi-Channel Broadcasting** - Post to all channels simultaneously
+
+### Legacy Coordination (Redis-backed)
 - 🤖 **LLM-Powered Workers** - Autonomous agents that write code using Claude/GPT APIs
-- 🎯 **Hierarchical Coordination** - Coordinators can manage other coordinators (CTO → Teams → Workers)
-- 🎨 **Interactive TUI** - Cyberpunk-themed dashboard with real-time monitoring
+- 🔒 **Atomic File Locking** - Prevent race conditions with Redis-backed locks
 - 📋 **Task Queue** - Priority-based task claiming with atomic operations
 - 🚀 **Dynamic Spawning** - Spawn workers on-demand (subprocess, Docker, Railway)
-- 🤝 **Agent Coordination** - Register agents, track heartbeats, detect hung agents
-- 🔒 **Atomic File Locking** - Prevent race conditions with Redis-backed locks
-- 💬 **Board System** - Threaded communication between agents
-- ✅ **Approval Workflows** - Blocking approval requests for critical operations
 - 📝 **Audit Logging** - Append-only decision log with Redis Streams
 - 🔄 **Automatic Fallback** - Gracefully degrades to file-based mode when Redis unavailable
 
@@ -39,7 +53,78 @@ The TUI provides:
 - Onboarding wizard for first-time users
 - Cyberpunk 90s aesthetic 🌈
 
-## Quick Start - Code
+## Quick Start - Company Model
+
+Create a company and route work across departments:
+
+```python
+from agentcoord.company import Company
+from agentcoord.workflows import Epic, WorkflowRouter, ArtifactStatus
+from agentcoord.roles import Role
+
+# Load company from template
+company = Company.from_template("janus_dev")
+# Creates: Product dept (PM, Designer), Engineering (EM, Engineers, SRE), QA (Lead, Engineers)
+
+# Create epic for new trading strategy
+epic = Epic(
+    id="epic-001",
+    title="Add IV Percentile Filter",
+    description="Filter trades to only enter when IV > 50th percentile",
+    workflow_type="trading_strategy",
+    status=ArtifactStatus.PENDING,
+    created_by="strategy_pm"
+)
+
+# Route epic - generates 8 tasks automatically
+router = WorkflowRouter(company)
+task_ids = router.route_epic(epic)
+# Creates: PM define goals → Designer schema → Eng implement → Eng test →
+#          QA backtest → QA validate → PM approve → SRE deploy
+
+# Find available agent for first task
+pm_agent = company.find_available_agent(role=Role.PRODUCT_MANAGER)
+print(f"Assigned to: {pm_agent.name}")
+
+# Agent claims and completes task
+pm_agent.claim_task(task_ids[0])
+pm_agent.complete_task(task_ids[0], result={"prd": "strategy_goals.md"})
+```
+
+### Communication Channels
+
+```python
+from agentcoord.channels import ChannelManager, TerminalChannel, FileChannel
+
+# Set up multi-channel communication
+channels = ChannelManager()
+channels.add_channel(TerminalChannel(name="console"))
+channels.add_channel(FileChannel(name="logs", log_dir="./logs"))
+
+# Broadcast to all channels
+channels.post(
+    channel="engineering",
+    message="Tests passing - ready for QA",
+    priority="NORMAL",
+    message_type="SUCCESS"
+)
+
+# Direct message
+channels.dm(
+    from_agent="backend_em",
+    to_agent="qa_lead",
+    message="Deploy candidate ready for validation"
+)
+
+# Create threaded conversation
+thread_id = channels.create_thread(
+    channel="design",
+    title="New Config Schema Review",
+    message="Proposed schema for IV percentile filter attached"
+)
+```
+
+## Quick Start - Legacy Coordination
 
 ```python
 from agentcoord import CoordinationClient
@@ -337,15 +422,53 @@ python3 examples/basic_usage.py
 - `ApprovalWorkflow` - Blocking approval requests
 - `AuditLog` - Append-only decision logging
 
+## Workflows
+
+AgentCoord includes 4 built-in workflow types:
+
+### 1. `trading_strategy` (8 tasks)
+For developing trading strategies (Janus use case):
+```
+PM define goals → Designer schema → Eng implement → Eng test →
+QA backtest → QA validate → PM approve → SRE deploy
+```
+**Approval gates:** strategy_config_schema, backtest_validation, production_trading_deploy (PM + QA Lead + EM)
+
+### 2. `feature` (6 tasks)
+Standard feature development:
+```
+PM PRD → Designer mocks → Eng implement → QA test → PM approve → Growth launch
+```
+**Approval gates:** design_kickoff, design_review, code_review, qa_signoff, production_release
+
+### 3. `bug` (3 tasks)
+Rapid bug fix cycle:
+```
+QA reproduce → Eng fix → QA verify
+```
+**Approval gates:** triage, code_review, qa_verification
+
+### 4. `launch` (6 tasks)
+Cross-functional product launch:
+```
+PM plan → (Growth content + Eng flags + Support docs) → QA regression → Growth execute
+```
+**Approval gates:** launch_plan_review, readiness_check
+
 ## Use Cases
 
+### Company Model
+- **Cross-Functional Coordination** - PM → Design → Eng → QA workflows with approval gates
+- **Trading Strategy Development** - Backtest validation, multi-gate production deploy
+- **Product Launches** - Coordinate Marketing, Engineering, QA, Support
+- **Multi-Department Projects** - Route work across Product, Engineering, QA
+
+### Legacy Coordination
 - **Autonomous Code Generation** - Spawn LLM workers to write code in parallel
 - **Hierarchical Coordination** - Build org charts of AI agents (CTO → Teams → Workers)
 - **Code Reviews** - Specialized AI agents review code from different perspectives
 - **Multi-agent AI Systems** - Coordinate multiple Claude/GPT instances
 - **Distributed Development** - Prevent file conflicts between agents
-- **Workflow Orchestration** - Task queue and approval gates
-- **System Monitoring** - Track agent health and decisions
 
 ## Real-World Results
 
@@ -357,7 +480,26 @@ python3 examples/basic_usage.py
 - Total cost: ~$3-4
 - Total time: ~30 minutes of parallel execution
 
+**Company Model (Phase 1):**
+- 17 roles across 5 departments with 50+ capabilities
+- 4 complete workflow types with automated task routing
+- 107 passing tests (roles, company hierarchy, channels)
+- Platform-agnostic communication (works with zero external dependencies)
+- Janus trading strategy workflow with 3-gate production approval
+
 **Dogfooding:** AgentCoord used AgentCoord to build and review AgentCoord. 🚀
+
+## Architecture
+
+**Company Model:**
+- `Role` - 17 roles with capability-based permissions
+- `Company` - Hierarchical org structure (Company → Department → Team → Agent)
+- `Epic/Story/Task` - Work artifacts with workflow routing
+- `WorkflowRouter` - Automated task generation from workflow type
+- `CommunicationChannel` - Platform-agnostic messaging (Terminal, File, Dashboard, Slack)
+- `ApprovalGate` - Multi-role approval requirements
+
+**Legacy Coordination:**
 
 ## License
 
