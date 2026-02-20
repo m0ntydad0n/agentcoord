@@ -1,117 +1,114 @@
-"""
-Agent registration and heartbeat monitoring.
-"""
-
-import threading
+"""Enhanced agent implementation with health monitoring."""
+import json
 import time
-from datetime import datetime, timezone
-from typing import Dict, Optional
-import logging
-
-logger = logging.getLogger(__name__)
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
 
 
 class AgentRegistry:
-    """Manages agent registration and heartbeat monitoring."""
+    """Simple agent registry for coordination."""
 
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self.heartbeat_thread: Optional[threading.Thread] = None
-        self.heartbeat_stop = threading.Event()
+    def __init__(self, redis_client=None):
+        """Initialize registry with optional Redis client."""
+        self.redis_client = redis_client
+        self.agents = {}
 
-    def register_agent(
-        self,
-        agent_id: str,
-        role: str,
-        name: str,
-        working_on: str = "",
-        session_id: str = ""
-    ):
-        """Register agent and start heartbeat thread."""
-        agent_key = f"agent:{agent_id}"
+    def register(self, agent_id: str, agent_type: str, capabilities: List[str]) -> str:
+        """Register an agent."""
+        self.agents[agent_id] = {
+            "type": agent_type,
+            "capabilities": capabilities,
+            "registered_at": time.time()
+        }
 
-        self.redis.hset(agent_key, mapping={
-            "role": role,
-            "name": name,
-            "status": "active",
-            "working_on": working_on,
-            "blocked_by": "",
-            "last_commit": "",
-            "session_id": session_id,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "last_heartbeat": datetime.now(timezone.utc).isoformat()
-        })
+        if self.redis_client:
+            key = f"agents:{agent_id}"
+            self.redis_client.setex(
+                key,
+                3600,  # 1 hour TTL
+                json.dumps(self.agents[agent_id])
+            )
 
-        # Add to heartbeats sorted set
-        self.redis.zadd("heartbeats", {agent_id: time.time()})
+        return agent_id
 
-        logger.info(f"Registered agent {agent_id} ({role}: {name})")
+    def unregister(self, agent_id: str):
+        """Unregister an agent."""
+        if agent_id in self.agents:
+            del self.agents[agent_id]
 
-        # Start heartbeat thread
-        self.start_heartbeat(agent_id)
+        if self.redis_client:
+            key = f"agents:{agent_id}"
+            self.redis_client.delete(key)
 
-    def start_heartbeat(self, agent_id: str, interval: int = 30):
-        """Start background heartbeat thread."""
-        def heartbeat_loop():
-            while not self.heartbeat_stop.wait(interval):
-                try:
-                    self.send_heartbeat(agent_id)
-                except Exception as e:
-                    logger.error(f"Heartbeat error for {agent_id}: {e}")
 
-        self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
+class Agent:
+    """Enhanced Agent class with health monitoring."""
 
-    def send_heartbeat(self, agent_id: str):
-        """Send heartbeat update."""
-        now = time.time()
-        self.redis.zadd("heartbeats", {agent_id: now})
-        self.redis.hset(
-            f"agent:{agent_id}",
-            "last_heartbeat",
-            datetime.now(timezone.utc).isoformat()
+    def __init__(self, agent_id: str):
+        self.agent_id = agent_id
+        self.redis_client = redis_pool_manager.get_client()
+        self.health_key = f"agents:{agent_id}:health"
+    
+    def update_health(self):
+        """Update health status in Redis."""
+        health_data = health_monitor.get_health_status()
+        self.redis_client.setex(
+            self.health_key,
+            600,  # 10 minutes TTL
+            json.dumps(health_data)
         )
-
-    def stop_heartbeat(self):
-        """Stop heartbeat thread."""
-        if self.heartbeat_thread:
-            self.heartbeat_stop.set()
-            self.heartbeat_thread.join(timeout=5)
-
-    def update_agent_status(self, agent_id: str, **kwargs):
-        """Update agent status fields."""
-        agent_key = f"agent:{agent_id}"
-        if kwargs:
-            self.redis.hset(agent_key, mapping=kwargs)
-
-    def get_agent(self, agent_id: str) -> Optional[Dict]:
-        """Get agent details."""
-        return self.redis.hgetall(f"agent:{agent_id}") or None
-
-    def list_agents(self) -> Dict[str, Dict]:
-        """List all registered agents."""
-        agents = {}
-        for key in self.redis.keys("agent:*"):
-            agent_id = key.split(":", 1)[1]
-            agents[agent_id] = self.redis.hgetall(key)
-        return agents
-
-    def get_stale_agents(self, threshold_seconds: int = 300) -> Dict[str, Dict]:
-        """Find agents with no heartbeat in threshold seconds."""
-        cutoff = time.time() - threshold_seconds
-        stale_ids = self.redis.zrangebyscore("heartbeats", "-inf", cutoff)
-
-        stale_agents = {}
-        for agent_id in stale_ids:
-            agent = self.get_agent(agent_id)
-            if agent:
-                stale_agents[agent_id] = agent
-
-        return stale_agents
-
-    def unregister_agent(self, agent_id: str):
-        """Unregister agent and cleanup."""
-        self.stop_heartbeat()
-        self.redis.delete(f"agent:{agent_id}")
-        self.redis.zrem("heartbeats", agent_id)
-        logger.info(f"Unregistered agent {agent_id}")
+    
+    def get_health_status(self) -> Optional[Dict[str, Any]]:
+        """Get health status for this agent."""
+        data = self.redis_client.get(self.health_key)
+        if data:
+            return json.loads(data)
+        return None
+    
+    def health_check_endpoint(self) -> Dict[str, Any]:
+        """Health check endpoint for workers."""
+        self.update_health()
+        return health_monitor.get_health_status()
+    
+    def complete_task(self):
+        """Mark task as completed and update health."""
+        health_monitor.update_task_completed()
+        self.update_health()
+    
+    @classmethod
+    def get_all_agents_health(cls) -> Dict[str, Dict[str, Any]]:
+        """Get health status for all agents."""
+        redis_client = get_redis_client()
+        health_data = {}
+        
+        # Find all agent health keys
+        keys = redis_client.keys("agents:*:health")
+        
+        for key in keys:
+            key_str = key.decode('utf-8') if isinstance(key, bytes) else key
+            agent_id = key_str.split(':')[1]
+            
+            data = redis_client.get(key)
+            if data:
+                try:
+                    health_data[agent_id] = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+        
+        return health_data
+    
+    @classmethod
+    def get_unhealthy_workers(cls, timeout_minutes: int = 5) -> List[str]:
+        """Get list of unhealthy worker IDs."""
+        health_data = cls.get_all_agents_health()
+        unhealthy = []
+        
+        timeout_seconds = timeout_minutes * 60
+        current_time = time.time()
+        
+        for agent_id, health in health_data.items():
+            last_heartbeat = health.get('timestamp', 0)
+            if (current_time - last_heartbeat) > timeout_seconds:
+                unhealthy.append(agent_id)
+        
+        return unhealthy

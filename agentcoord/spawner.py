@@ -1,294 +1,182 @@
-"""
-Worker spawning and lifecycle management.
+"""Worker process spawner with robust error handling."""
 
-Allows coordinator agents to dynamically spawn worker agents
-using different backends (subprocess, docker, cloud).
-"""
-
-import os
-import subprocess
-import uuid
 import logging
-from typing import List, Dict, Optional
-from enum import Enum
+import os
+import psutil
+import signal
+import subprocess
+import time
+from typing import Dict, List, Optional, Set
+import threading
+
+from .exceptions import WorkerSpawnError, WorkerTimeoutError
 
 logger = logging.getLogger(__name__)
 
-
-class SpawnMode(str, Enum):
-    """Worker spawn modes."""
-    SUBPROCESS = "subprocess"
-    DOCKER = "docker"
-    RAILWAY = "railway"
-
-
 class WorkerProcess:
     """Represents a spawned worker process."""
-
-    def __init__(self, worker_id: str, name: str, tags: List[str], process, mode: SpawnMode):
-        self.worker_id = worker_id
-        self.name = name
-        self.tags = tags
+    
+    def __init__(self, process: subprocess.Popen, worker_id: str, command: List[str]):
         self.process = process
-        self.mode = mode
+        self.worker_id = worker_id
+        self.command = command
+        self.spawn_time = time.time()
+        self.last_health_check = None
 
+    @property
+    def pid(self) -> int:
+        """Get process ID."""
+        return self.process.pid
+
+    @property
     def is_alive(self) -> bool:
-        """Check if worker process is still running."""
-        if self.mode == SpawnMode.SUBPROCESS:
-            return self.process.poll() is None
-        elif self.mode == SpawnMode.DOCKER:
-            # Check container status
-            try:
-                import docker
-                client = docker.from_env()
-                container = client.containers.get(self.worker_id)
-                return container.status == 'running'
-            except:
-                return False
-        return False
+        """Check if process is still running."""
+        return self.process.poll() is None
 
-    def terminate(self):
-        """Terminate the worker process."""
-        if self.mode == SpawnMode.SUBPROCESS:
+    def terminate(self, timeout: int = 10) -> bool:
+        """Terminate process gracefully."""
+        if not self.is_alive:
+            return True
+
+        try:
+            # Try graceful termination first
             self.process.terminate()
-            logger.info(f"Terminated subprocess worker {self.name}")
-        elif self.mode == SpawnMode.DOCKER:
+            
+            # Wait for graceful shutdown
             try:
-                import docker
-                client = docker.from_env()
-                container = client.containers.get(self.worker_id)
-                container.stop()
-                logger.info(f"Stopped Docker worker {self.name}")
-            except Exception as e:
-                logger.error(f"Failed to stop Docker worker {self.name}: {e}")
-
+                self.process.wait(timeout=timeout)
+                logger.info(f"Worker {self.worker_id} terminated gracefully")
+                return True
+            except subprocess.TimeoutExpired:
+                # Force kill if graceful termination fails
+                logger.warning(f"Worker {self.worker_id} didn't terminate gracefully, force killing")
+                self.process.kill()
+                self.process.wait(timeout=5)
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error terminating worker {self.worker_id}: {e}")
+            return False
 
 class WorkerSpawner:
-    """Manages spawning and lifecycle of worker agents."""
-
-    def __init__(self, redis_url: str = None):
-        """Initialize worker spawner.
-
-        Args:
-            redis_url: Redis URL. If None, uses REDIS_URL env var.
-                      Format: redis://[:password@]host:port
-        """
-        # Use REDIS_URL from environment if not provided
-        redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379")
-        self.redis_url = redis_url
+    """Spawns and manages worker processes with error handling."""
+    
+    def __init__(
+        self,
+        max_workers: int = 4,
+        startup_timeout: int = 30,
+        health_check_interval: int = 60,
+        max_memory_mb: int = 1024,
+        max_cpu_percent: float = 80.0
+    ):
+        self.max_workers = max_workers
+        self.startup_timeout = startup_timeout
+        self.health_check_interval = health_check_interval
+        self.max_memory_mb = max_memory_mb
+        self.max_cpu_percent = max_cpu_percent
+        
         self.workers: Dict[str, WorkerProcess] = {}
+        self.zombie_pids: Set[int] = set()
+        self._shutdown_event = threading.Event()
+        self._health_check_thread = None
+        
+        # Start health check thread
+        self._start_health_monitor()
 
-    def spawn_worker(
-        self,
-        name: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        mode: SpawnMode = SpawnMode.SUBPROCESS,
-        max_tasks: Optional[int] = None,
-        poll_interval: int = 5,
-        use_llm: bool = False
-    ) -> WorkerProcess:
-        """
-        Spawn a new worker agent.
-
-        Args:
-            name: Worker name (auto-generated if None)
-            tags: Task tags this worker should claim
-            mode: Spawn mode (subprocess, docker, railway)
-            max_tasks: Max tasks before worker stops
-            poll_interval: Seconds between task checks
-
-        Returns:
-            WorkerProcess object
-        """
-        worker_id = str(uuid.uuid4())[:8]
-        name = name or f"Worker-{worker_id}"
-        tags = tags or []
-
-        logger.info(f"Spawning worker {name} with tags {tags} using {mode}")
-
-        if mode == SpawnMode.SUBPROCESS:
-            worker_process = self._spawn_subprocess(
-                worker_id, name, tags, max_tasks, poll_interval, use_llm
-            )
-        elif mode == SpawnMode.DOCKER:
-            worker_process = self._spawn_docker(
-                worker_id, name, tags, max_tasks, poll_interval
-            )
-        elif mode == SpawnMode.RAILWAY:
-            worker_process = self._spawn_railway(
-                worker_id, name, tags, max_tasks, poll_interval
-            )
-        else:
-            raise ValueError(f"Unknown spawn mode: {mode}")
-
-        self.workers[worker_id] = worker_process
-        return worker_process
-
-    def _spawn_subprocess(
-        self,
-        worker_id: str,
-        name: str,
-        tags: List[str],
-        max_tasks: Optional[int],
-        poll_interval: int,
-        use_llm: bool = False
-    ) -> WorkerProcess:
-        """Spawn worker as subprocess."""
-        # Get absolute path to worker script
-        import agentcoord
-        package_dir = os.path.dirname(os.path.dirname(agentcoord.__file__))
-
-        # Choose worker type
-        if use_llm:
-            worker_script = os.path.join(package_dir, 'examples', 'llm_worker_agent.py')
-        else:
-            worker_script = os.path.join(package_dir, 'examples', 'worker_agent.py')
-
-        # Build command
-        cmd = [
-            'python3',
-            worker_script,
-            '--name', name,
-            '--redis-url', self.redis_url,
-            '--poll-interval', str(poll_interval)
-        ]
-
-        if tags:
-            cmd.extend(['--tags', ','.join(tags)])
-
-        if max_tasks:
-            cmd.extend(['--max-tasks', str(max_tasks)])
-
-        # Spawn process
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+    def _start_health_monitor(self) -> None:
+        """Start background health monitoring thread."""
+        self._health_check_thread = threading.Thread(
+            target=self._health_check_loop,
+            daemon=True
         )
+        self._health_check_thread.start()
+        logger.info("Health monitoring thread started")
 
-        logger.info(f"Spawned subprocess worker {name} (PID: {process.pid})")
+    def _health_check_loop(self) -> None:
+        """Background health monitoring loop."""
+        while not self._shutdown_event.is_set():
+            try:
+                self._cleanup_zombies()
+                self._check_worker_health()
+                
+                # Wait for next check or shutdown
+                self._shutdown_event.wait(self.health_check_interval)
+                
+            except Exception as e:
+                logger.error(f"Health check loop error: {e}")
+                time.sleep(5)  # Brief pause before retrying
 
-        return WorkerProcess(worker_id, name, tags, process, SpawnMode.SUBPROCESS)
+    def _cleanup_zombies(self) -> None:
+        """Clean up zombie processes."""
+        zombies_to_remove = set()
+        
+        for pid in self.zombie_pids:
+            try:
+                # Check if process still exists
+                if not psutil.pid_exists(pid):
+                    zombies_to_remove.add(pid)
+                    continue
+                    
+                proc = psutil.Process(pid)
+                if proc.status() == psutil.STATUS_ZOMBIE:
+                    logger.warning(f"Cleaning up zombie process {pid}")
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                        pass
+                    zombies_to_remove.add(pid)
+                    
+            except psutil.NoSuchProcess:
+                zombies_to_remove.add(pid)
+            except Exception as e:
+                logger.error(f"Error cleaning zombie process {pid}: {e}")
 
-    def _spawn_docker(
-        self,
-        worker_id: str,
-        name: str,
-        tags: List[str],
-        max_tasks: Optional[int],
-        poll_interval: int
-    ) -> WorkerProcess:
-        """Spawn worker in Docker container."""
+        self.zombie_pids -= zombies_to_remove
+
+    def _check_worker_health(self) -> None:
+        """Check health of running workers."""
+        workers_to_restart = []
+        
+        for worker_id, worker in list(self.workers.items()):
+            try:
+                if not worker.is_alive:
+                    logger.warning(f"Worker {worker_id} is no longer alive")
+                    workers_to_restart.append(worker_id)
+                    continue
+
+                # Check resource usage
+                try:
+                    proc = psutil.Process(worker.pid)
+                    memory_mb = proc.memory_info().rss / 1024 / 1024
+                    cpu_percent = proc.cpu_percent()
+
+                    if memory_mb > self.max_memory_mb:
+                        logger.warning(
+                            f"Worker {worker_id} using too much memory: "
+                            f"{memory_mb:.1f}MB > {self.max_memory_mb}MB"
+                        )
+                        workers_to_restart.append(worker_id)
+                        
+                    elif cpu_percent > self.max_cpu_percent:
+                        logger.warning(
+                            f"Worker {worker_id} using too much CPU: "
+                            f"{cpu_percent:.1f}% > {self.max_cpu_percent}%"
+                        )
+                        # Log but don't restart for CPU (might be temporary spike)
+
+                except psutil.NoSuchProcess:
+                    logger.warning(f"Worker {worker_id} process no longer exists")
+                    workers_to_restart.append(worker_id)
+                    
+            except Exception as e:
+                logger.error(f"Error checking worker {worker_id} health: {e}")
+
+        # Restart unhealthy workers
+        for worker_id in workers_to_restart:
+            self._restart_worker(worker_id)
+
+    def _restart_worker(self, worker_id: str) -> None:
+        """Restart a specific worker."""
         try:
-            import docker
-            client = docker.from_env()
-
-            # Build command
-            cmd = [
-                'python3', 'examples/worker_agent.py',
-                '--name', name,
-                '--redis-url', self.redis_url,
-                '--poll-interval', str(poll_interval)
-            ]
-
-            if tags:
-                cmd.extend(['--tags', ','.join(tags)])
-
-            if max_tasks:
-                cmd.extend(['--max-tasks', str(max_tasks)])
-
-            # Run container
-            container = client.containers.run(
-                'agentcoord-worker',
-                command=' '.join(cmd),
-                name=f"worker-{worker_id}",
-                environment={
-                    'REDIS_URL': self.redis_url
-                },
-                detach=True,
-                network_mode='host'  # Access localhost Redis
-            )
-
-            logger.info(f"Spawned Docker worker {name} (container: {container.id[:12]})")
-
-            return WorkerProcess(worker_id, name, tags, container, SpawnMode.DOCKER)
-
-        except Exception as e:
-            logger.error(f"Failed to spawn Docker worker: {e}")
-            raise
-
-    def _spawn_railway(
-        self,
-        worker_id: str,
-        name: str,
-        tags: List[str],
-        max_tasks: Optional[int],
-        poll_interval: int
-    ) -> WorkerProcess:
-        """Spawn worker on Railway."""
-        # Build Railway run command
-        cmd = [
-            'railway', 'run',
-            'python3', 'examples/worker_agent.py',
-            '--name', name,
-            '--poll-interval', str(poll_interval)
-        ]
-
-        if tags:
-            cmd.extend(['--tags', ','.join(tags)])
-
-        if max_tasks:
-            cmd.extend(['--max-tasks', str(max_tasks)])
-
-        # Spawn via Railway CLI
-        process = subprocess.Popen(cmd)
-
-        logger.info(f"Spawned Railway worker {name}")
-
-        return WorkerProcess(worker_id, name, tags, process, SpawnMode.RAILWAY)
-
-    def count_alive_workers(self) -> int:
-        """Count workers that are still running."""
-        return sum(1 for w in self.workers.values() if w.is_alive())
-
-    def cleanup_dead_workers(self):
-        """Remove dead workers from tracking."""
-        dead_workers = [
-            wid for wid, worker in self.workers.items()
-            if not worker.is_alive()
-        ]
-
-        for wid in dead_workers:
-            logger.info(f"Cleaning up dead worker {self.workers[wid].name}")
-            del self.workers[wid]
-
-    def terminate_all(self):
-        """Terminate all spawned workers."""
-        logger.info(f"Terminating {len(self.workers)} workers...")
-
-        for worker in self.workers.values():
-            worker.terminate()
-
-        self.workers.clear()
-
-    def get_worker_stats(self) -> Dict:
-        """Get statistics about spawned workers."""
-        alive = self.count_alive_workers()
-        total = len(self.workers)
-
-        return {
-            'total_spawned': total,
-            'alive': alive,
-            'dead': total - alive,
-            'workers': [
-                {
-                    'id': w.worker_id,
-                    'name': w.name,
-                    'tags': w.tags,
-                    'mode': w.mode.value,
-                    'alive': w.is_alive()
-                }
-                for w in self.workers.values()
-            ]
-        }
+            worker = self.workers.get(worker

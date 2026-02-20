@@ -1,262 +1,233 @@
-"""Main CoordinationClient for Redis-based multi-agent coordination."""
+"""AgentCoord client with robust error handling."""
 
-import redis
-import uuid
-import os
+import json
+import logging
 import time
-from typing import Optional
-from contextlib import contextmanager
-from .agent import AgentRegistry
-from .locks import FileLock
-from .tasks import TaskQueue, Task
-from .board import Board, BoardThread
-from .approvals import ApprovalWorkflow, Approval
-from .audit import AuditLog
+from typing import Any, Dict, Optional, Union
+import redis
+from redis.exceptions import ConnectionError, TimeoutError, RedisError
 
+from .exceptions import RedisConnectionError, ValidationError
 
-class CoordinationClient:
-    """Central coordination client for multi-agent systems."""
+logger = logging.getLogger(__name__)
 
-    def __init__(self, redis_url: str = None, fallback_dir: str = "./workbench"):
-        """Initialize coordination client.
+class AgentClient:
+    """Client for interacting with AgentCoord with robust error handling."""
+    
+    def __init__(
+        self,
+        host: str = 'localhost',
+        port: int = 6379,
+        db: int = 0,
+        password: Optional[str] = None,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        connection_timeout: int = 30
+    ):
+        self.host = host
+        self.port = port
+        self.db = db
+        self.password = password
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.connection_timeout = connection_timeout
+        self._redis = None
+        self._connect()
 
-        Args:
-            redis_url: Redis connection URL. If None, uses REDIS_URL env var.
-                      Format: redis://[:password@]host:port
-                      For TLS: rediss://[:password@]host:port
-                      Examples:
-                        - redis://localhost:6379 (dev, no auth)
-                        - redis://:mypassword@localhost:6379 (with auth)
-                        - rediss://:prod-pass@redis.example.com:6380 (prod TLS)
-            fallback_dir: Directory for file-based fallback (default: ./workbench)
-        """
-        # Use REDIS_URL from environment if not provided
-        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379")
-        self.fallback_dir = fallback_dir
-        self.redis_client: Optional[redis.Redis] = None
-
-        # Try to connect to Redis
+    def _connect(self) -> None:
+        """Establish Redis connection with error handling."""
         try:
-            self.redis_client = redis.from_url(
-                self.redis_url,
-                socket_connect_timeout=1,
+            self._redis = redis.Redis(
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                password=self.password,
+                socket_connect_timeout=self.connection_timeout,
+                socket_timeout=self.connection_timeout,
+                retry_on_timeout=True,
                 decode_responses=True
             )
-            self.redis_client.ping()
-            self.mode = "redis"
-        except (redis.ConnectionError, redis.TimeoutError, Exception):
-            # Fall back to file-based coordination
-            self.mode = "file"
-            self.redis_client = None
+            # Test connection
+            self._redis.ping()
+            logger.info(f"Connected to Redis at {self.host}:{self.port}")
+        except (ConnectionError, TimeoutError) as e:
+            raise RedisConnectionError(
+                f"Failed to connect to Redis at {self.host}:{self.port}: {e}"
+            ) from e
+        except Exception as e:
+            raise RedisConnectionError(
+                f"Unexpected error connecting to Redis: {e}"
+            ) from e
 
-        self.agent_id: Optional[str] = None
-        self._agent_registry: Optional[AgentRegistry] = None
+    def _validate_task_data(self, task_data: Dict[str, Any]) -> None:
+        """Validate task data before sending."""
+        if not isinstance(task_data, dict):
+            raise ValidationError(f"Task data must be a dictionary, got {type(task_data)}")
+        
+        if 'task_id' not in task_data:
+            raise ValidationError("Task data must include 'task_id'")
+        
+        if not task_data['task_id']:
+            raise ValidationError("Task 'task_id' cannot be empty")
+        
+        # Validate JSON serializable
+        try:
+            json.dumps(task_data)
+        except (TypeError, ValueError) as e:
+            raise ValidationError(f"Task data must be JSON serializable: {e}") from e
 
-    def register_agent(self, role: str, name: str, working_on: str = "") -> str:
-        """Register agent and return agent ID.
+    def _validate_queue_name(self, queue_name: str) -> None:
+        """Validate queue name."""
+        if not isinstance(queue_name, str):
+            raise ValidationError(f"Queue name must be string, got {type(queue_name)}")
+        
+        if not queue_name or not queue_name.strip():
+            raise ValidationError("Queue name cannot be empty")
+        
+        if len(queue_name) > 200:
+            raise ValidationError(f"Queue name too long: {len(queue_name)} chars (max 200)")
 
-        Args:
-            role: Agent role (e.g., "CTO", "Engineer")
-            name: Agent name
-            working_on: Current task description
+    def _execute_with_retry(self, operation_name: str, operation_func, *args, **kwargs):
+        """Execute Redis operation with retry logic."""
+        last_error = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                return operation_func(*args, **kwargs)
+            except (ConnectionError, TimeoutError) as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    logger.warning(
+                        f"{operation_name} failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. "
+                        f"Retrying in {self.retry_delay}s..."
+                    )
+                    time.sleep(self.retry_delay)
+                    # Try to reconnect
+                    try:
+                        self._connect()
+                    except RedisConnectionError:
+                        pass  # Will retry on next iteration
+                else:
+                    break
+            except RedisError as e:
+                # Non-connection Redis errors - don't retry
+                raise RedisConnectionError(
+                    f"{operation_name} failed with Redis error: {e}"
+                ) from e
+            except Exception as e:
+                # Unexpected errors
+                raise RedisConnectionError(
+                    f"{operation_name} failed with unexpected error: {e}"
+                ) from e
+        
+        raise RedisConnectionError(
+            f"{operation_name} failed after {self.max_retries + 1} attempts. "
+            f"Last error: {last_error}"
+        )
 
-        Returns:
-            Agent ID string
-        """
-        agent_id = str(uuid.uuid4())
-        self.agent_id = agent_id
+    def submit_task(self, queue_name: str, task_data: Dict[str, Any]) -> bool:
+        """Submit task to queue with validation and retry logic."""
+        try:
+            self._validate_queue_name(queue_name)
+            self._validate_task_data(task_data)
+        except ValidationError as e:
+            logger.error(f"Task submission validation failed: {e}")
+            raise
 
-        if self.mode == "redis" and self.redis_client:
-            self._agent_registry = AgentRegistry(self.redis_client)
-            self._agent_registry.register_agent(agent_id, role, name, working_on)
+        def _submit():
+            task_json = json.dumps(task_data)
+            result = self._redis.lpush(f"queue:{queue_name}", task_json)
+            logger.info(f"Task {task_data.get('task_id')} submitted to queue '{queue_name}'")
+            return result > 0
 
-        # File mode will be implemented later
-        return agent_id
+        return self._execute_with_retry(
+            f"Submit task to queue '{queue_name}'",
+            _submit
+        )
 
-    @contextmanager
-    def lock_file(self, path: str, intent: str = ""):
-        """Context manager for atomic file locking.
+    def get_result(self, result_key: str, timeout: int = 30) -> Optional[Dict[str, Any]]:
+        """Get task result with timeout and retry logic."""
+        if not isinstance(result_key, str) or not result_key.strip():
+            raise ValidationError("Result key must be a non-empty string")
 
-        Args:
-            path: File path to lock
-            intent: Description of why lock is needed
-
-        Yields:
-            Lock context
-
-        Raises:
-            LockAcquireTimeout: If lock cannot be acquired within timeout
-        """
-        if not self.agent_id:
-            raise ValueError("Must call register_agent() before locking files")
-
-        if self.mode == "redis" and self.redis_client:
-            # Use Redis-based locking
-            with FileLock(self.redis_client, path, self.agent_id, intent) as lock:
-                yield lock
-        else:
-            # File-based locking fallback
-            # Simple file lock using lock files
-            os.makedirs(self.fallback_dir, exist_ok=True)
-            lock_file = os.path.join(self.fallback_dir, ".lock")
-
-            # Simple file-based lock (no-op for now, just for test)
-            yield None
-
-    def claim_task(self, tags: Optional[list] = None) -> Optional[Task]:
-        """Claim a task from the queue.
-
-        Args:
-            tags: Optional list of tags to filter tasks
-
-        Returns:
-            Task object if claimed, None if no tasks available
-        """
-        if not self.agent_id:
-            raise ValueError("Must call register_agent() before claiming tasks")
-
-        if self.mode == "redis" and self.redis_client:
-            task_queue = TaskQueue(self.redis_client)
-            return task_queue.claim_task(self.agent_id, tags=tags)
-
-        # File mode fallback
-        return None
-
-    def post_thread(
-        self,
-        title: str,
-        message: str,
-        priority: str = "normal"
-    ) -> Optional[BoardThread]:
-        """Post a thread to the board.
-
-        Args:
-            title: Thread title
-            message: Initial message
-            priority: Priority level ("high", "normal", "low")
-
-        Returns:
-            BoardThread object if posted, None in file mode
-        """
-        if not self.agent_id:
-            raise ValueError("Must call register_agent() before posting threads")
-
-        if self.mode == "redis" and self.redis_client:
-            board = Board(self.redis_client)
-            return board.post_thread(title, message, self.agent_id, priority)
-
-        # File mode fallback
-        return None
-
-    def request_approval(
-        self,
-        action_type: str,
-        description: str,
-        timeout: int = 300
-    ) -> Optional[Approval]:
-        """Request approval for an action (blocking).
-
-        Args:
-            action_type: Type of action ("commit", "deploy", etc.)
-            description: Description of what needs approval
-            timeout: Timeout in seconds
-
-        Returns:
-            Approval object with status
-        """
-        if not self.agent_id:
-            raise ValueError("Must call register_agent() before requesting approval")
-
-        if self.mode == "redis" and self.redis_client:
-            approval_workflow = ApprovalWorkflow(self.redis_client)
-            return approval_workflow.request_approval(
-                self.agent_id,
-                action_type,
-                description,
-                timeout
-            )
-
-        # File mode fallback - auto-approve
-        return None
-
-    def log_decision(
-        self,
-        decision_type: str,
-        context: str,
-        reason: str
-    ):
-        """Log a decision to the audit log.
-
-        Args:
-            decision_type: Type of decision
-            context: Context for the decision
-            reason: Reason for the decision
-        """
-        if not self.agent_id:
-            raise ValueError("Must call register_agent() before logging decisions")
-
-        if self.mode == "redis" and self.redis_client:
-            audit_log = AuditLog(self.redis_client)
-            audit_log.log_decision(self.agent_id, decision_type, context, reason)
-
-        # File mode fallback - no-op for now
-
-    def export_to_markdown(self, status_file: str, board_file: str):
-        """Export coordination state to markdown files.
-
-        Args:
-            status_file: Path to STATUS.md file
-            board_file: Path to BOARD.md file
-        """
-        # TODO: Implement markdown export
-        # This will read from Redis and write to files
-        pass
-
-    def shutdown(self):
-        """Gracefully shutdown client, releasing resources."""
-        if self._agent_registry:
-            self._agent_registry.stop_heartbeat()
-
-        if self.agent_id and self.mode == "redis" and self.redis_client:
-            # Unregister agent
-            if self._agent_registry:
-                self._agent_registry.unregister_agent(self.agent_id)
-
-    @classmethod
-    @contextmanager
-    def session(
-        cls,
-        redis_url: str,
-        role: str,
-        name: str,
-        working_on: str = "",
-        fallback_dir: str = "./workbench"
-    ):
-        """Context manager for a complete coordination session.
-
-        Args:
-            redis_url: Redis connection URL
-            role: Agent role
-            name: Agent name
-            working_on: Current task description
-            fallback_dir: Directory for file-based fallback
-
-        Yields:
-            CoordinationClient instance with agent registered
-
-        Example:
-            with CoordinationClient.session(
-                redis_url="redis://localhost:6379",
-                role="CTO",
-                name="Claude"
-            ) as coord:
-                with coord.lock_file("main.py", intent="Add feature"):
-                    pass
-        """
-        client = cls(redis_url=redis_url, fallback_dir=fallback_dir)
-        client.register_agent(role=role, name=name, working_on=working_on)
+        def _get_result():
+            result = self._redis.brpop(f"result:{result_key}", timeout=timeout)
+            if result:
+                _, result_json = result
+                try:
+                    return json.loads(result_json)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse result JSON for key '{result_key}': {e}")
+                    return {"error": "Invalid result format", "raw_data": result_json}
+            return None
 
         try:
-            yield client
-        finally:
-            client.shutdown()
+            return self._execute_with_retry(
+                f"Get result for key '{result_key}'",
+                _get_result
+            )
+        except RedisConnectionError:
+            logger.error(f"Failed to get result for key '{result_key}' after retries")
+            raise
+
+    def get_queue_length(self, queue_name: str) -> int:
+        """Get queue length with error handling."""
+        try:
+            self._validate_queue_name(queue_name)
+        except ValidationError as e:
+            logger.error(f"Queue length check validation failed: {e}")
+            raise
+
+        def _get_length():
+            return self._redis.llen(f"queue:{queue_name}")
+
+        return self._execute_with_retry(
+            f"Get length of queue '{queue_name}'",
+            _get_length
+        )
+
+    def health_check(self) -> Dict[str, Any]:
+        """Check client and Redis health."""
+        health = {
+            "client_ok": True,
+            "redis_connected": False,
+            "redis_info": None,
+            "errors": []
+        }
+
+        try:
+            # Test Redis connection
+            self._redis.ping()
+            health["redis_connected"] = True
+            
+            # Get Redis info
+            info = self._redis.info()
+            health["redis_info"] = {
+                "redis_version": info.get("redis_version"),
+                "used_memory_human": info.get("used_memory_human"),
+                "connected_clients": info.get("connected_clients")
+            }
+            
+        except Exception as e:
+            health["client_ok"] = False
+            health["errors"].append(f"Redis health check failed: {e}")
+            logger.error(f"Health check failed: {e}")
+
+        return health
+
+    def close(self) -> None:
+        """Close Redis connection gracefully."""
+        if self._redis:
+            try:
+                self._redis.close()
+                logger.info("Redis connection closed")
+            except Exception as e:
+                logger.warning(f"Error closing Redis connection: {e}")
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()

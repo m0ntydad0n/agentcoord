@@ -23,7 +23,7 @@ Usage:
             pass
 """
 
-from .client import CoordinationClient
+from .coordination_client import CoordinationClient
 from .locks import LockAcquireTimeout, FileLock
 from .tasks import Task, TaskStatus, TaskQueue
 from .board import BoardThread, ThreadStatus
