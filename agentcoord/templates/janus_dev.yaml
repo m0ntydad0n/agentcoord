@@ -1,0 +1,42 @@
+name: "Janus Development Team"
+project_path: "~/Desktop/Janus_Engine/janus"
+
+departments:
+  - name: product
+    teams:
+      - name: strategy
+        lead:
+          role: pm
+          name: "strategy_pm"
+        members:
+          - role: designer
+            name: "config_designer"
+
+  - name: engineering
+    teams:
+      - name: backend
+        lead:
+          role: em
+          name: "backend_em"
+        members:
+          - role: senior_eng
+            name: "filters_eng"
+          - role: engineer
+            name: "pricing_eng"
+      - name: infrastructure
+        lead:
+          role: sre
+          name: "devops_lead"
+        members:
+          - role: sre
+            name: "telegram_eng"
+
+  - name: qa
+    teams:
+      - name: testing
+        lead:
+          role: qa_lead
+          name: "qa_lead"
+        members:
+          - role: qa_eng
+            name: "backtest_eng"
