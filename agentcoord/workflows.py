@@ -83,7 +83,7 @@ class Epic(WorkArtifact):
     - "Fix Login Bug" (bug workflow)
     """
 
-    workflow_type: str
+    workflow_type: str = ""
     stories: List['Story'] = field(default_factory=list)
     generated_task_ids: List[str] = field(default_factory=list)
     priority: int = 0
@@ -121,7 +121,7 @@ class Story(WorkArtifact):
     - "Backend API Implementation" (within "User Auth" epic)
     """
 
-    epic_id: str
+    epic_id: str = ""
     task_ids: List[str] = field(default_factory=list)
     assigned_role: Optional[Role] = None
 
