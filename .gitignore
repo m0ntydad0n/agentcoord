@@ -77,3 +77,13 @@ examples/nexus_style_demo.py
 *_BUILD_*.md
 QUICK_START.md
 .env
+
+# AgentCoord build artifacts
+task_*.log
+*-worker-*.log
+agentcoord_tasks.db
+*.db
+bootstrap_implementation.py
+monitor_coordination.py
+orchestrate_implementation.py
+view_tasks.py
