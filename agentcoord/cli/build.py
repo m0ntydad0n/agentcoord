@@ -17,13 +17,147 @@ from rich.table import Table
 console = Console()
 
 
+def check_file_exists(target_path: Path) -> bool:
+    """Check if target file already exists.
+
+    Args:
+        target_path: Path to the target file
+
+    Returns:
+        True if file exists, False otherwise
+    """
+    return target_path.exists()
+
+
+def check_class_exists(file_path: Path, class_name: str) -> bool:
+    """Check if a class is already defined in a file.
+
+    Args:
+        file_path: Path to Python file to search
+        class_name: Name of class to search for
+
+    Returns:
+        True if class found, False otherwise
+    """
+    if not file_path.exists():
+        return False
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except (IOError, OSError):
+        return False
+
+    import re
+    pattern = rf'^class {re.escape(class_name)}[:\(]'
+    return bool(re.search(pattern, content, re.MULTILINE))
+
+
+def apply_modification(target_path: Path, new_code: str, task: dict, workspace_path: Path) -> bool:
+    """Apply code modification with conflict detection.
+
+    Args:
+        target_path: Path to file
+        new_code: Code to add
+        task: Task metadata with action type
+        workspace_path: Workspace root path
+
+    Returns:
+        True if modification applied, False if skipped
+    """
+    import re
+
+    if task['action'] == 'CREATE':
+        if target_path.exists():
+            console.print(f"⚠️  File already exists: {target_path}", style="yellow")
+            console.print(f"   Skipping {task['title']}")
+            return False
+
+        # Safe to create
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(target_path, 'w', encoding='utf-8') as f:
+                f.write(new_code)
+            return True
+        except Exception as e:
+            console.print(f"❌ Error creating file {target_path}: {e}", style="red")
+            return False
+
+    elif task['action'] == 'MODIFY':
+        if not target_path.exists():
+            console.print(f"⚠️  Target file does not exist: {target_path}", style="yellow")
+            console.print(f"   Cannot MODIFY non-existent file for {task['title']}")
+            return False
+
+        # Extract class names from new code
+        class_names = re.findall(r'^class (\w+)[:\(]', new_code, re.MULTILINE)
+
+        # Check for duplicates
+        duplicates = []
+        for class_name in class_names:
+            if check_class_exists(target_path, class_name):
+                duplicates.append(class_name)
+
+        if duplicates:
+            console.print(f"⚠️  Duplicate classes found: {', '.join(duplicates)}", style="yellow")
+            console.print(f"   File: {target_path}")
+            console.print(f"   Skipping {task['title']} to avoid conflicts")
+            return False
+
+        # Safe to append
+        try:
+            with open(target_path, 'a', encoding='utf-8') as f:
+                f.write('\n\n' + new_code)
+            return True
+        except Exception as e:
+            console.print(f"❌ Error modifying file {target_path}: {e}", style="red")
+            return False
+
+    else:
+        console.print(f"⚠️  Unknown action type: {task['action']}", style="yellow")
+        return False
+
+
+def get_related_files(target_file: str, workspace_path: Path) -> str:
+    """Get context from related files in the same directory.
+
+    Args:
+        target_file: Path to target file
+        workspace_path: Workspace root path
+
+    Returns:
+        String with file listing and class definitions
+    """
+    target_path = Path(target_file)
+    parent_dir = workspace_path / target_path.parent
+
+    if not parent_dir.exists():
+        return "No existing files in target directory"
+
+    related = []
+    for py_file in parent_dir.glob("*.py"):
+        try:
+            with open(py_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            import re
+            classes = re.findall(r'^class (\w+)[:\(]', content, re.MULTILINE)
+            if classes:
+                related.append(f"{py_file.name}: {', '.join(classes)}")
+        except Exception:
+            continue
+
+    return '\n'.join(related) if related else "No Python files found"
+
+
 @click.command()
 @click.argument('request', required=True)
 @click.option('--workspace', default='.', help='Workspace directory')
 @click.option('--max-workers', default=5, type=int, help='Maximum parallel workers')
 @click.option('--model', default='sonnet', type=click.Choice(['haiku', 'sonnet', 'opus']))
 @click.option('--docs-dir', default='docs', help='Directory containing design docs')
-def build(request: str, workspace: str, max_workers: int, model: str, docs_dir: str):
+@click.option('--dry-run', is_flag=True, help='Show what would be done without executing')
+def build(request: str, workspace: str, max_workers: int, model: str, docs_dir: str, dry_run: bool):
     """
     Autonomous parallel implementation from a single high-level prompt.
 
@@ -193,6 +327,36 @@ Return ONLY valid JSON, no other text."""
         console.print(f"  {complexity_icon} {task['title']}{deps}")
         console.print(f"     → {task['target_file']}")
 
+    # Dry-run mode: show what would be done and exit
+    if dry_run:
+        console.print("\n[bold yellow]DRY RUN MODE[/bold yellow]")
+        console.print("Would create/modify the following:\n")
+
+        for task in plan['tasks']:
+            action_icon = "📝" if task['action'] == 'CREATE' else "✏️"
+            console.print(f"{action_icon} {task['action']}: {task['target_file']}")
+            console.print(f"   Task: {task['title']}")
+
+            # Check for conflicts
+            target_path = workspace_path / task['target_file']
+            if task['action'] == 'CREATE' and check_file_exists(target_path):
+                console.print(f"   ⚠️  WARNING: File already exists", style="yellow")
+
+            # Check for duplicate classes if MODIFY
+            if task['action'] == 'MODIFY' and target_path.exists():
+                import re
+                # Try to extract class names from spec
+                spec_content = docs_content.get(task.get('spec_file', ''), '')
+                class_names = re.findall(r'^class (\w+)[:\(]', spec_content, re.MULTILINE)
+                duplicates = [cn for cn in class_names if check_class_exists(target_path, cn)]
+                if duplicates:
+                    console.print(f"   ⚠️  WARNING: Duplicate classes: {', '.join(duplicates)}", style="yellow")
+
+            console.print()
+
+        console.print("[dim]Run without --dry-run to execute[/dim]")
+        return
+
     # Confirm before proceeding
     if not click.confirm(f"\n💡 Proceed with implementation? This will spawn up to {max_workers} workers", default=True):
         console.print("\n⚠️  Cancelled by user")
@@ -234,39 +398,50 @@ Return ONLY valid JSON, no other text."""
 
                 # Create implementation prompt
                 spec_content = docs_content.get(task['spec_file'], '')
+                related_files = get_related_files(task['target_file'], workspace_path)
 
-                impl_prompt = f"""Implement this task from the specification.
+                impl_prompt = f"""You are implementing a task as part of a larger codebase.
+
+CRITICAL: Before writing code, check if similar functionality already exists.
+If you find existing implementations of classes/functions you're about to create, STOP and return:
+
+DUPLICATE_FOUND: <class_name> already exists in <file_path>
+
+Only proceed if you're certain it's new functionality.
 
 TASK: {task['title']}
 
 DESCRIPTION:
 {task['description']}
 
+TARGET FILE: {task['target_file']}
+ACTION: {task['action']}
+
 SPECIFICATION (from {task['spec_file']}):
 {spec_content}
 
 FOCUS ON: {task['spec_section']}
 
-TARGET FILE: {task['target_file']}
-ACTION: {task['action']}
+EXISTING CODEBASE CONTEXT:
+{related_files}
 
-OUTPUT:
-Provide complete, production-ready code.
+INSTRUCTIONS:
+1. Review the EXISTING CODEBASE CONTEXT above
+2. Check if any classes/functions you plan to implement already exist
+3. If duplicates found, return "DUPLICATE_FOUND: <details>" and STOP
+4. If no duplicates, implement following the specification
+5. Include all necessary imports
+6. Add type hints and docstrings with examples
+7. Handle errors appropriately
 
-If MODIFY: Show the complete section to add
-If CREATE: Show the complete file contents
-
-Include:
-- All imports needed
-- Complete implementation
-- Type hints for all parameters
-- Docstrings with examples
-- Error handling
-
-Begin with:
+OUTPUT FORMAT:
+If implementing new code:
 ```python
-# ... your implementation
-```"""
+# Your complete implementation
+```
+
+If duplicate found:
+DUPLICATE_FOUND: <class_name> already exists in <file_path>"""
 
                 # Run implementation in subprocess
                 cmd = [
@@ -350,18 +525,15 @@ print(response.content[0].text)
 
         code = code_match.group(1)
 
-        # Write to target file
+        # Apply modification with conflict detection
         target_path = workspace_path / task['target_file']
-        target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if task['action'] == 'CREATE':
-            with open(target_path, 'w') as f:
-                f.write(code)
-            console.print(f"  📝 Created {task['target_file']}")
-        else:  # MODIFY
-            with open(target_path, 'a') as f:
-                f.write('\n\n' + code)
-            console.print(f"  📝 Modified {task['target_file']}")
+        if apply_modification(target_path, code, task, workspace_path):
+            action_verb = "Created" if task['action'] == 'CREATE' else "Modified"
+            console.print(f"  📝 {action_verb} {task['target_file']}")
+        else:
+            console.print(f"  ⏭️  Skipped {task['target_file']} (conflict detected)")
+            continue
 
         # Run tests
         if task.get('test_command'):
