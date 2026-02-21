@@ -76,3 +76,4 @@ examples/nexus_style_demo.py
 *_GUIDE.md
 *_BUILD_*.md
 QUICK_START.md
+.env
